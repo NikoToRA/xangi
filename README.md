@@ -4,13 +4,13 @@
 
 > **A**I **N**EON **G**ENESIS **I**NTELLIGENCE
 
-Claude Code / Codex / Gemini CLI / Local LLM をバックエンドに、Discord / Slack から利用できる AI アシスタント。Discord 推奨。
+Claude Code / Codex / Gemini CLI / Local LLM をバックエンドに、Discord / Slack / Telegram から利用できる AI アシスタント。Discord 推奨。
 
 ## Features
 
 - マルチバックエンド対応（Claude Code / Codex / Gemini CLI / Local LLM）
 - Local LLM対応（Ollama/vLLM等、エージェントモード/チャットモード切替可能）
-- Discord / Slack 対応
+- Discord / Slack / Telegram 対応
 - Docker対応
 - スキルシステム
 - スケジューラー（cron / 単発 / 起動時タスク）
@@ -20,7 +20,7 @@ Claude Code / Codex / Gemini CLI / Local LLM をバックエンドに、Discord 
 
 ```mermaid
 graph LR
-    User --> |メッセージ| Chat[Chat Platform<br/>Discord / Slack]
+    User --> |メッセージ| Chat[Chat Platform<br/>Discord / Slack / Telegram]
     Chat --> |プロンプト| xangi
     xangi --> |実行| CLI[AI Backend<br/>Claude Code / Codex<br/>Gemini CLI / Local LLM]
     CLI --> |ファイル操作| WS[Workspace<br/>skills / AGENTS.md]
@@ -36,13 +36,17 @@ graph LR
 cp .env.example .env
 ```
 
-**最低限の設定（.env）:**
+**最低限の設定（.env）の例:**
 ```bash
 # Discord Bot Token（必須）
 DISCORD_TOKEN=your_discord_bot_token
 
 # 許可ユーザーID（必須、カンマ区切りで複数可、"*"で全員許可）
 DISCORD_ALLOWED_USER=123456789012345678
+
+# または Telegram Bot Token
+# TELEGRAM_TOKEN=1234567890:telegram-bot-token
+# TELEGRAM_ALLOWED_USER=7959072373
 ```
 
 > 💡 作業ディレクトリはデフォルトで `./workspace` を使用。変更する場合は `WORKSPACE_PATH` を設定。
@@ -68,7 +72,7 @@ npm run dev
 
 ### 3. 動作確認
 
-Discord で bot にメンションして話しかけてください。
+Discord ではメンション、Telegram では bot へ直接メッセージして動作確認してください。
 
 ### 自動再起動（pm2）
 
@@ -86,6 +90,7 @@ pm2 logs xangi     # ログ確認
 ### 基本
 - `@xangi 質問内容` - メンションで反応
 - 専用チャンネル設定時はメンション不要
+- Telegram では bot へ直接送信。`/new` と `/stop` を利用可能
 
 ### 主なコマンド
 
@@ -127,6 +132,8 @@ docker compose up xangi-gpu -d --build
 |------|------|
 | `DISCORD_TOKEN` | Discord Bot Token |
 | `DISCORD_ALLOWED_USER` | 許可ユーザーID（カンマ区切りで複数可、`*`で全員許可） |
+| `TELEGRAM_TOKEN` | Telegram Bot Token |
+| `TELEGRAM_ALLOWED_USER` | 許可ユーザーID（Telegram user ID） |
 
 全ての環境変数（オプション含む）は [使い方ガイド](docs/usage.md#環境変数一覧) を参照してください。
 

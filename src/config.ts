@@ -38,6 +38,13 @@ export interface Config {
     streaming?: boolean;
     showThinking?: boolean;
   };
+  telegram: {
+    enabled: boolean;
+    token?: string;
+    allowedUsers?: string[];
+    streaming?: boolean;
+    showThinking?: boolean;
+  };
   agent: {
     backend: AgentBackend;
     config: AgentConfig;
@@ -55,14 +62,18 @@ export function loadConfig(): Config {
   const discordToken = process.env.DISCORD_TOKEN;
   const slackBotToken = process.env.SLACK_BOT_TOKEN;
   const slackAppToken = process.env.SLACK_APP_TOKEN;
+  const telegramToken = process.env.TELEGRAM_TOKEN;
 
-  // 少なくともどちらかが有効である必要がある
-  if (!discordToken && !slackBotToken) {
-    throw new Error('DISCORD_TOKEN or SLACK_BOT_TOKEN environment variable is required');
+  // 少なくともどれか1つが有効である必要がある
+  if (!discordToken && !slackBotToken && !telegramToken) {
+    throw new Error(
+      'DISCORD_TOKEN, SLACK_BOT_TOKEN, or TELEGRAM_TOKEN environment variable is required'
+    );
   }
 
   const discordAllowedUser = process.env.DISCORD_ALLOWED_USER;
   const slackAllowedUser = process.env.SLACK_ALLOWED_USER;
+  const telegramAllowedUser = process.env.TELEGRAM_ALLOWED_USER;
   const discordAllowedUsers = discordAllowedUser
     ? discordAllowedUser
         .split(',')
@@ -71,6 +82,12 @@ export function loadConfig(): Config {
     : [];
   const slackAllowedUsers = slackAllowedUser
     ? slackAllowedUser
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  const telegramAllowedUsers = telegramAllowedUser
+    ? telegramAllowedUser
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean)
@@ -91,11 +108,14 @@ export function loadConfig(): Config {
   // プラットフォーム自動検出
   const discordEnabled = !!discordToken;
   const slackEnabled = !!slackBotToken && !!slackAppToken;
+  const telegramEnabled = !!telegramToken;
   let platform: ChatPlatform | undefined;
-  if (discordEnabled && !slackEnabled) {
+  if (discordEnabled && !slackEnabled && !telegramEnabled) {
     platform = 'discord';
-  } else if (slackEnabled && !discordEnabled) {
+  } else if (slackEnabled && !discordEnabled && !telegramEnabled) {
     platform = 'slack';
+  } else if (telegramEnabled && !discordEnabled && !slackEnabled) {
+    platform = 'telegram';
   }
   // 両方有効 → undefined（全コマンド注入）
 
@@ -138,6 +158,13 @@ export function loadConfig(): Config {
       replyInThread: process.env.SLACK_REPLY_IN_THREAD !== 'false',
       streaming: process.env.SLACK_STREAMING !== 'false',
       showThinking: process.env.SLACK_SHOW_THINKING !== 'false',
+    },
+    telegram: {
+      enabled: !!telegramToken,
+      token: telegramToken,
+      allowedUsers: telegramAllowedUsers,
+      streaming: process.env.TELEGRAM_STREAMING !== 'false',
+      showThinking: process.env.TELEGRAM_SHOW_THINKING !== 'false',
     },
     agent: {
       backend,

@@ -19,6 +19,7 @@ import { ClaudeCodeRunner } from './claude-code.js';
 import { processManager } from './process-manager.js';
 import { loadSkills, formatSkillList, type Skill } from './skills.js';
 import { startSlackBot } from './slack.js';
+import { startTelegramBot } from './telegram.js';
 import {
   downloadFile,
   extractFilePaths,
@@ -158,6 +159,7 @@ async function main() {
   // 許可リストのチェック（"*" で全員許可、カンマ区切りで複数ユーザー対応）
   const discordAllowed = config.discord.allowedUsers || [];
   const slackAllowed = config.slack.allowedUsers || [];
+  const telegramAllowed = config.telegram.allowedUsers || [];
 
   if (config.discord.enabled && discordAllowed.length === 0) {
     console.error('[xangi] Error: DISCORD_ALLOWED_USER must be set (use "*" to allow everyone)');
@@ -165,6 +167,10 @@ async function main() {
   }
   if (config.slack.enabled && slackAllowed.length === 0) {
     console.error('[xangi] Error: SLACK_ALLOWED_USER must be set (use "*" to allow everyone)');
+    process.exit(1);
+  }
+  if (config.telegram.enabled && telegramAllowed.length === 0) {
+    console.error('[xangi] Error: TELEGRAM_ALLOWED_USER must be set (use "*" to allow everyone)');
     process.exit(1);
   }
 
@@ -177,6 +183,11 @@ async function main() {
     console.log('[xangi] Slack: All users are allowed');
   } else if (slackAllowed.length > 0) {
     console.log(`[xangi] Slack: Allowed users: ${slackAllowed.join(', ')}`);
+  }
+  if (telegramAllowed.includes('*')) {
+    console.log('[xangi] Telegram: All users are allowed');
+  } else if (telegramAllowed.length > 0) {
+    console.log(`[xangi] Telegram: Allowed users: ${telegramAllowed.join(', ')}`);
   }
 
   const client = new Client({
@@ -1550,9 +1561,17 @@ async function main() {
     console.log('[xangi] Slack bot started');
   }
 
-  if (!config.discord.enabled && !config.slack.enabled) {
+  if (config.telegram.enabled) {
+    await startTelegramBot({
+      config,
+      agentRunner,
+    });
+    console.log('[xangi] Telegram bot started');
+  }
+
+  if (!config.discord.enabled && !config.slack.enabled && !config.telegram.enabled) {
     console.error(
-      '[xangi] No chat platform enabled. Set DISCORD_TOKEN or SLACK_BOT_TOKEN/SLACK_APP_TOKEN'
+      '[xangi] No chat platform enabled. Set DISCORD_TOKEN, SLACK_BOT_TOKEN/SLACK_APP_TOKEN, or TELEGRAM_TOKEN'
     );
     process.exit(1);
   }

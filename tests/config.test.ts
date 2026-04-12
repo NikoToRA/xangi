@@ -15,10 +15,13 @@ describe('config', () => {
   it('should throw error when no tokens are set', async () => {
     delete process.env.DISCORD_TOKEN;
     delete process.env.SLACK_BOT_TOKEN;
+    delete process.env.TELEGRAM_TOKEN;
 
     // キャッシュをクリアして再インポート
     const { loadConfig } = await import('../src/config.js');
-    expect(() => loadConfig()).toThrow('DISCORD_TOKEN or SLACK_BOT_TOKEN');
+    expect(() => loadConfig()).toThrow(
+      'DISCORD_TOKEN, SLACK_BOT_TOKEN, or TELEGRAM_TOKEN'
+    );
   });
 
   it('should load Discord config when DISCORD_TOKEN is set', async () => {
@@ -83,5 +86,18 @@ describe('config', () => {
 
     expect(config.scheduler.enabled).toBe(false);
     expect(config.scheduler.startupEnabled).toBe(false);
+  });
+
+  it('should load Telegram config when TELEGRAM_TOKEN is set', async () => {
+    process.env.TELEGRAM_TOKEN = 'test-telegram-token';
+    process.env.TELEGRAM_ALLOWED_USER = '7959072373';
+
+    const { loadConfig } = await import('../src/config.js');
+    const config = loadConfig();
+
+    expect(config.telegram.enabled).toBe(true);
+    expect(config.telegram.token).toBe('test-telegram-token');
+    expect(config.telegram.allowedUsers).toContain('7959072373');
+    expect(config.agent.platform).toBe('telegram');
   });
 });

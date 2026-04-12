@@ -4,13 +4,13 @@
 
 > **A**I **N**EON **G**ENESIS **I**NTELLIGENCE
 
-An AI assistant for Discord / Slack, powered by Claude Code / Codex / Gemini CLI / Local LLM backends. Discord recommended.
+An AI assistant for Discord / Slack / Telegram, powered by Claude Code / Codex / Gemini CLI / Local LLM backends. Discord recommended.
 
 ## Features
 
 - Multi-backend support (Claude Code / Codex / Gemini CLI / Local LLM)
 - Local LLM support (Ollama/vLLM, etc.)
-- Discord / Slack support
+- Discord / Slack / Telegram support
 - Docker support
 - Skill system
 - Scheduler (cron / one-shot / startup tasks)
@@ -20,7 +20,7 @@ An AI assistant for Discord / Slack, powered by Claude Code / Codex / Gemini CLI
 
 ```mermaid
 graph LR
-    User --> |Message| Chat[Chat Platform<br/>Discord / Slack]
+    User --> |Message| Chat[Chat Platform<br/>Discord / Slack / Telegram]
     Chat --> |Prompt| xangi
     xangi --> |Execute| CLI[AI Backend<br/>Claude Code / Codex<br/>Gemini CLI / Local LLM]
     CLI --> |File ops| WS[Workspace<br/>skills / AGENTS.md]
@@ -36,13 +36,17 @@ graph LR
 cp .env.example .env
 ```
 
-**Minimum required settings (.env):**
+**Example minimum settings (.env):**
 ```bash
 # Discord Bot Token (required)
 DISCORD_TOKEN=your_discord_bot_token
 
 # Allowed user ID (required, comma-separated for multiple, "*" for all)
 DISCORD_ALLOWED_USER=123456789012345678
+
+# Or Telegram Bot Token
+# TELEGRAM_TOKEN=1234567890:telegram-bot-token
+# TELEGRAM_ALLOWED_USER=7959072373
 ```
 
 > 💡 The working directory defaults to `./workspace`. Set `WORKSPACE_PATH` to change it.
@@ -68,7 +72,7 @@ npm run dev
 
 ### 3. Verify
 
-Mention the bot in Discord to start a conversation.
+Mention the bot in Discord, or send a direct message in Telegram, to verify the setup.
 
 ### Auto-restart (pm2)
 
@@ -86,6 +90,7 @@ pm2 logs xangi     # View logs
 ### Basics
 - `@xangi your question` - Mention to interact
 - No mention needed in dedicated channels
+- In Telegram, send a direct message to the bot. `/new` and `/stop` are supported
 
 ### Commands
 
@@ -127,6 +132,8 @@ See [Usage Guide: Docker](docs/usage.md#docker実行) for details.
 |----------|-------------|
 | `DISCORD_TOKEN` | Discord Bot Token |
 | `DISCORD_ALLOWED_USER` | Allowed user IDs (comma-separated, `*` for all) |
+| `TELEGRAM_TOKEN` | Telegram Bot Token |
+| `TELEGRAM_ALLOWED_USER` | Allowed Telegram user ID |
 
 See [Usage Guide](docs/usage.md#環境変数一覧) for all environment variables.
 
