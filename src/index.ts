@@ -2,6 +2,7 @@ import {
   Client,
   GatewayIntentBits,
   Events,
+  Partials,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -12,9 +13,24 @@ import {
   ButtonBuilder,
   ButtonStyle,
 } from 'discord.js';
+import { execSync } from 'node:child_process';
+import {
+  statSync,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  renameSync,
+  unlinkSync,
+} from 'node:fs';
+import { dirname as pathDirname } from 'node:path';
+
 import { loadConfig } from './config.js';
 import { isGitHubAppEnabled } from './github-auth.js';
-import { createAgentRunner, getBackendDisplayName, type AgentRunner } from './agent-runner.js';
+import { resolveApproval, requestApproval, setApprovalEnabled } from './approval.js';
+import { getBackendDisplayName, type AgentRunner } from './agent-runner.js';
+import { BackendResolver } from './backend-resolver.js';
+import { DynamicRunnerManager } from './dynamic-runner.js';
 import { ClaudeCodeRunner } from './claude-code.js';
 import { processManager } from './process-manager.js';
 import { loadSkills, formatSkillList, type Skill } from './skills.js';
@@ -35,10 +51,1456 @@ import {
   type Platform,
   type ScheduleType,
 } from './scheduler.js';
-import { initSessions, getSession, setSession, deleteSession } from './sessions.js';
+import {
+  initSessions,
+  getSession,
+  setSession,
+  deleteSession,
+  ensureSession,
+  incrementMessageCount,
+  getActiveSessionId,
+} from './sessions.js';
 import { join } from 'path';
 import { config as dotenvConfig } from 'dotenv';
+import { startWebChat } from './web-chat.js';
 dotenvConfig({ override: true });
+
+// === Izuna Action Hook (Phase 4) ===
+import { execFile, spawn as spawnProc } from 'child_process';
+import { join as pathJoin } from 'path';
+
+/** チャンネルごとに直近 bot が送ったメッセージ ID (削除/編集参照用) */
+const lastSentMessageIds = new Map<string, string>();
+
+const ACTION_HOOK_RE = /\[ACTION:(\w+)(?:\s*(\{[\s\S]*?\}))?\s*\]?/g;
+const ACTION_SCRIPTS_DIR = pathJoin(process.env.HOME || '', '.openclaw/workspace/scripts');
+const GATE_RESPONDER_PATH = pathJoin(ACTION_SCRIPTS_DIR, 'gate_responder.py');
+const ACTION_EXECUTOR_PATH = pathJoin(ACTION_SCRIPTS_DIR, 'action_executor.py');
+const ACTION_ENV = {
+  ...process.env,
+  PYTHONPATH: '/Users/suguru/Library/Python/3.9/lib/python/site-packages',
+};
+
+// === Discord Gate (Phase 4b): L2/L3 confirmation via Discord buttons ===
+interface PendingGate {
+  actionName: string;
+  paramsStr: string;
+  hashPrefix: string;
+  tier: string;
+  token2: string | null;
+  channelId: string;
+  messageId: string;
+  expiresAt: number;
+}
+const pendingGates = new Map<string, PendingGate>();
+// L3 second-step: token2 -> first token
+const pendingL3SecondStep = new Map<string, string>();
+
+function execPython(args: string[], timeout = 30000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      'python3',
+      args,
+      {
+        timeout,
+        cwd: ACTION_SCRIPTS_DIR,
+        env: ACTION_ENV,
+      },
+      (err, stdout, stderr) => {
+        if (err) {
+          reject(new Error(stderr || err.message));
+          return;
+        }
+        resolve(stdout);
+      }
+    );
+  });
+}
+
+function formatActionResult(actionName: string, parsed: any): string {
+  if (parsed.ok) {
+    if (actionName === 'calendar_create') {
+      return (
+        '\u{1f4c5} ' +
+        (parsed.event?.summary || '\u4e88\u5b9a') +
+        ' \u3092\u767b\u9332\u3057\u307e\u3057\u305f'
+      );
+    } else if (actionName === 'gmail_draft') {
+      return '\u2709\ufe0f \u4e0b\u66f8\u304d\u3092\u4f5c\u6210\u3057\u307e\u3057\u305f';
+    } else if (actionName === 'calendar_list') {
+      const evts = parsed.events || [];
+      return (
+        evts.map((e: any) => '- ' + e.start + ' ' + e.summary).join('\n') ||
+        '\u4e88\u5b9a\u306a\u3057'
+      );
+    } else if (actionName === 'script_write') {
+      const typeJa: Record<string, string> = {
+        character: '\u30ad\u30e3\u30e9\u30af\u30bf\u30fc\u8a2d\u5b9a',
+        outline: '\u3042\u3089\u3059\u3058\u30fb\u69cb\u6210',
+        scene: '\u30b7\u30fc\u30f3',
+        brainstorm: '\u58c1\u6253\u3061\u30e1\u30e2',
+      };
+      const label = typeJa[parsed.type as string] || parsed.type || 'script';
+      const parts: string[] = [
+        `\u2705 ${label} (${parsed.chars || 0}\u5b57) \u3092 \`${parsed.file ? String(parsed.file).split('/').pop() : ''}\` \u306b\u4fdd\u5b58\u3057\u307e\u3057\u305f`,
+      ];
+      if (parsed.file) {
+        parts.push(`MEDIA:${parsed.file}`);
+      }
+      // 全文表示: full_content 優先. splitMessage で 2000 字チャンクに分割される.
+      if (parsed.full_content) {
+        parts.push('\n---\n' + String(parsed.full_content));
+      } else if (parsed.preview) {
+        parts.push(
+          '\n---\n' +
+            String(parsed.preview).slice(0, 500) +
+            ' ...(\u672c\u6587\u306f' +
+            (parsed.chars || 0) +
+            '\u5b57, \u30d5\u30a1\u30a4\u30eb\u3092\u78ba\u8a8d' +
+            (parsed.file ? ':\\`' + String(parsed.file).split('/').pop() + '\\`' : '') +
+            ')'
+        );
+      }
+      return parts.join('\n');
+    } else if (actionName === 'script_list') {
+      const files = parsed.files || [];
+      if (files.length === 0)
+        return '\ud83d\udcc1 \u30d7\u30ed\u30b8\u30a7\u30af\u30c8\u5185\u306b\u30d5\u30a1\u30a4\u30eb\u306a\u3057';
+      const lines = files.map(
+        (f: { path: string; chars: number; mtime: string }) =>
+          `- \`${f.path}\` (${f.chars}\u5b57, ${f.mtime})`
+      );
+      return (
+        `\ud83d\udcc1 **\u30d5\u30a1\u30a4\u30eb\u4e00\u89a7** (${parsed.project || 'manga'}, ${files.length}\u4ef6)\n` +
+        lines.join('\n')
+      );
+    } else if (actionName === 'script_read') {
+      const content = parsed.content || '';
+      const fname = parsed.file ? String(parsed.file).split('/').pop() : '';
+      const preview = content.slice(0, 500);
+      const truncated =
+        content.length > 500
+          ? '\n\n...(\u4ee5\u4e0b\u7701\u7565, \u5168\u4f53 ' +
+            parsed.chars +
+            '\u5b57, \u6dfb\u4ed8\u53c2\u7167)'
+          : '';
+      const media = parsed.file ? `\nMEDIA:${parsed.file}` : '';
+      return `\ud83d\udcc4 **${fname}**${media}\n\n${preview}${truncated}`;
+    } else if (actionName === 'video_analyze') {
+      const dur = parsed.duration_sec ? `${parsed.duration_sec}秒` : '';
+      const frames = parsed.frames_analyzed || 0;
+      const ptime = parsed.processing_time_sec ? ` (処理${parsed.processing_time_sec}秒)` : '';
+      return `🎬 動画解説${dur ? ` [${dur}]` : ''} (${frames}フレーム分析)${ptime}\n\n${parsed.summary || '(解説なし)'}`;
+    } else if (actionName === 'video_from_url') {
+      if (parsed.reply_text) return `🎬 ${parsed.reply_text}`;
+      const dur = parsed.duration_sec ? `${parsed.duration_sec}秒` : '';
+      return `🎬 動画解説${dur ? ` [${dur}]` : ''}\n\n${parsed.summary || '(解説なし)'}`;
+    } else if (actionName === 'video_elaborate') {
+      if (!parsed.ok) {
+        return `🎬 ${parsed.error || '追加解説失敗'}${parsed.hint ? `\n${parsed.hint}` : ''}`;
+      }
+      return `🎬 **追加解説**\n> ${(parsed.question || '').slice(0, 150)}\n\n${parsed.answer || '(回答なし)'}`;
+    } else if (actionName === 'voice_transcribe') {
+      const dur = parsed.duration_sec ? `${parsed.duration_sec}秒` : '';
+      const asr = parsed.asr_time_sec ? ` (処理${parsed.asr_time_sec}秒)` : '';
+      const txt = parsed.transcript || '(書き起こし結果なし)';
+      return `🎤 音声書き起こし${dur ? ` [${dur}]` : ''}${asr}\n\n${txt}`;
+    } else if (actionName === 'voice_list') {
+      const voices = parsed.voices || [];
+      if (voices.length === 0) return '📁 音声アーカイブが空です';
+      const lines = voices.map(
+        (v: any) => `- ${v.timestamp} (${v.duration_sec}秒) ${v.preview?.slice(0, 50) || ''}`
+      );
+      return `📁 **音声一覧** (${parsed.date}, ${voices.length}件)\n` + lines.join('\n');
+    } else if (actionName === 'voice_read') {
+      return `📄 **書き起こし**\n\n${parsed.transcript || '(なし)'}`;
+    } else if (actionName === 'publish_voice') {
+      const title = parsed.title || '(no title)';
+      const dur = parsed.duration_sec ? `${parsed.duration_sec}秒` : '';
+      const tgt = parsed.target || '';
+      const sid = parsed.staging_id || '';
+      const status = parsed.status || 'staged';
+      let msg = `🎙️ ${tgt} → **${title}** ${dur ? `[${dur}]` : ''}\nID: \`${sid}\`  状態: ${status}`;
+      if (parsed.summary) msg += `\n${parsed.summary}`;
+      if (parsed.upload && typeof parsed.upload === 'object') {
+        for (const [t, r] of Object.entries(parsed.upload as Record<string, any>)) {
+          if (r && r.ok && r.url) msg += `\n- ${t}: ✅ ${r.url}`;
+          else if (r && r.skipped) msg += `\n- ${t}: ⏭ skip (${r.reason || ''})`;
+          else msg += `\n- ${t}: ❌ ${r?.error || 'failed'}`;
+        }
+      }
+      return msg;
+    } else if (actionName === 'discord_admin') {
+      const msg = parsed.message || `\u2705 ${actionName}`;
+      const url = parsed.url ? `\n\ud83d\udd17 ${parsed.url}` : '';
+      return msg + url;
+    } else {
+      return '\u2705 ' + actionName + ' \u5b8c\u4e86';
+    }
+  } else {
+    return '\u26a0\ufe0f ' + actionName + ': ' + (parsed.error || '\u30a8\u30e9\u30fc');
+  }
+}
+
+/** Gate 承認ボタン (L2) */
+function createGateButtons(token: string): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`gate_approve_${token}`)
+      .setLabel('\u2705 \u627f\u8a8d')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`gate_deny_${token}`)
+      .setLabel('\u274c \u62d2\u5426')
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
+/** Gate L3: 拒否ボタンのみ (承認はテキスト "YES" 入力) */
+function createL3GateButtons(token: string): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`gate_deny_${token}`)
+      .setLabel('\u274c \u62d2\u5426')
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
+/** gate_responder.py respond を呼ぶ */
+async function respondToGate(
+  token: string,
+  hashPrefix: string | null,
+  answer: string
+): Promise<{ ok: boolean; reason: string }> {
+  try {
+    const args = [GATE_RESPONDER_PATH, 'respond', '--token', token, '--answer', answer];
+    if (hashPrefix) {
+      args.push('--hash', hashPrefix);
+    }
+    const result = await execPython(args, 10000);
+    return JSON.parse(result);
+  } catch (err: any) {
+    return { ok: false, reason: err.message };
+  }
+}
+
+/** Gate 承認後にアクション実行 (--skip-gate) */
+async function executeGatedAction(actionName: string, paramsStr: string): Promise<string> {
+  try {
+    const result = await execPython(
+      [ACTION_EXECUTOR_PATH, '--action', actionName, '--params', paramsStr, '--skip-gate'],
+      180000
+    );
+    const parsed = JSON.parse(result);
+    return formatActionResult(actionName, parsed);
+  } catch (err: any) {
+    return '\u26a0\ufe0f ' + actionName + ': ' + err.message;
+  }
+}
+
+/** 期限切れ gate をクリーンアップ */
+function cleanupExpiredGates(): void {
+  const now = Date.now();
+  for (const [token, gate] of pendingGates) {
+    if (now > gate.expiresAt) {
+      pendingGates.delete(token);
+      if (gate.token2) pendingL3SecondStep.delete(gate.token2);
+    }
+  }
+}
+
+/**
+ * data carrying な ACTION (read-only / 結果 payload を持つ) の名前。
+ * これらが正常完了した場合、parsed 結果を LLM に再注入して
+ * 要約させる(processIzunaActions の戻り値 feedbackPayload で受け渡す)。
+ */
+const DATA_FEEDBACK_ACTIONS = new Set<string>([
+  'memory_sample',
+  'memory_search',
+  'memory_stats',
+  'memory_where',
+  'memory_recall',
+  'agent_bus_recent',
+  'agent_bus_stats',
+  'memory_list_pending',
+  'task_list',
+  'calendar_list',
+  'script_list',
+  'voice_list',
+]);
+
+/**
+ * 実データを渡したのに「データ無い/取得できません」系の諦め文を返してきたか判定する。
+ * これに当たった場合、同 session の "空振り結論" が支配してるので session を消して次ターン以降を救う。
+ */
+const GIVE_UP_PATTERNS: RegExp[] = [
+  /データ(が|は)?(ない|ありません|無い|存在しません)/,
+  /情報(が|は)?(ない|ありません|無い|不足)/,
+  /取得(でき|出来)?(ません|なかった|られません)/,
+  /見当たりません/,
+  /何も(ない|ありません|残ってい(ない|ません))/,
+  /把握(でき|出来)て(いません|ない)/,
+  /(該当|対応)(する)?.{0,8}(ありません|無し|なし)/,
+  /(まとめ|整理|要約).{0,4}(出来|でき)(ませんでした|ない)/,
+];
+function looksLikeGiveUp(text: string): boolean {
+  if (!text) return false;
+  return GIVE_UP_PATTERNS.some((re) => re.test(text));
+}
+
+async function processIzunaActions(
+  text: string,
+  channelId: string,
+  sendFn: (
+    content: string,
+    components?: ActionRowBuilder<ButtonBuilder>[]
+  ) => Promise<Message | null>
+): Promise<{ cleanText: string; actionMessages: string[]; feedbackPayload?: string }> {
+  cleanupExpiredGates();
+  const matches = [...text.matchAll(ACTION_HOOK_RE)];
+  if (matches.length === 0) return { cleanText: text, actionMessages: [] };
+  const cleanText = text.replace(ACTION_HOOK_RE, '').trim();
+  const actionMessages: string[] = [];
+  let feedbackPayload: string | undefined;
+  for (const m of matches.slice(0, 1)) {
+    const actionName = m[1];
+    const paramsStr = m[2] || '{}';
+    try {
+      // Step 1: Gate tier 判定
+      const gateResult = await execPython([
+        ACTION_EXECUTOR_PATH,
+        '--action',
+        actionName,
+        '--params',
+        paramsStr,
+        '--check-gate',
+      ]);
+      const gateInfo = JSON.parse(gateResult);
+
+      if (gateInfo.needs_gate) {
+        // L2/L3: Discord 確認 UI を表示
+        const tierLabel =
+          gateInfo.tier === 'L3_double_confirm'
+            ? '\u{1f534} L3 \u4e8c\u91cd\u78ba\u8a8d'
+            : '\u{1f7e0} L2 \u5916\u90e8\u52b9\u679c';
+        const preview = (gateInfo.preview || '').slice(0, 1500);
+        // calendar_create は人間可読 preview なのでコードブロックで囲まない
+        const gateMsg =
+          actionName === 'calendar_create'
+            ? `${tierLabel} 📅 **予定登録 確認**\n${preview}\n`
+            : `${tierLabel}\n**Action:** \`${actionName}\`\n\`\`\`json\n${preview}\n\`\`\`\n`;
+
+        let fullMsg: string;
+        let components: ActionRowBuilder<ButtonBuilder>[];
+        if (gateInfo.tier === 'L3_double_confirm') {
+          fullMsg =
+            gateMsg +
+            '\u26a0\ufe0f **L3 \u4e8c\u91cd\u78ba\u8a8d**: \u627f\u8a8d\u3059\u308b\u306b\u306f `YES` \u3068\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044 (5\u5206\u4ee5\u5185)';
+          components = [createL3GateButtons(gateInfo.token)];
+        } else {
+          fullMsg =
+            gateMsg +
+            '\u627f\u8a8d\u307e\u305f\u306f\u62d2\u5426\u3057\u3066\u304f\u3060\u3055\u3044 (5\u5206\u4ee5\u5185)';
+          components = [createGateButtons(gateInfo.token)];
+        }
+
+        const sentMsg = await sendFn(fullMsg, components);
+
+        // Pending gate 登録
+        pendingGates.set(gateInfo.token, {
+          actionName,
+          paramsStr,
+          hashPrefix: gateInfo.hash_prefix,
+          tier: gateInfo.tier,
+          token2: gateInfo.token2 || null,
+          channelId,
+          messageId: sentMsg?.id || '',
+          expiresAt: Date.now() + 5 * 60 * 1000,
+        });
+        if (gateInfo.token2) {
+          pendingL3SecondStep.set(gateInfo.token2, gateInfo.token);
+        }
+        console.log(
+          `[gate] Pending ${gateInfo.tier} gate: ${gateInfo.token.slice(0, 12)}... action=${actionName}`
+        );
+        actionMessages.push(`\u23f3 ${actionName}: \u627f\u8a8d\u5f85\u3061`);
+      } else if (gateInfo.decision === 'deny') {
+        actionMessages.push(
+          `\u{1f6ab} ${actionName}: \u30b2\u30fc\u30c8\u62d2\u5426 \u2014 ${gateInfo.reason}`
+        );
+      } else {
+        // L0/L1: gate 不要 -> 直接実行
+        const result = await execPython(
+          [ACTION_EXECUTOR_PATH, '--action', actionName, '--params', paramsStr],
+          180000
+        );
+        const parsed = JSON.parse(result);
+        actionMessages.push(formatActionResult(actionName, parsed));
+        // data carrying ACTION の結果は LLM に再注入して要約させる
+        if (parsed?.ok && DATA_FEEDBACK_ACTIONS.has(actionName)) {
+          try {
+            const json = JSON.stringify(parsed, null, 2);
+            // 8KB クランプ — claude prompt 圧迫を防ぐ
+            feedbackPayload = `[${actionName}]\n${json.length > 8000 ? json.slice(0, 8000) + '\n... (truncated)' : json}`;
+          } catch {
+            /* JSON 化失敗時は feedback しない */
+          }
+        }
+      }
+    } catch (err: any) {
+      actionMessages.push('\u26a0\ufe0f ' + actionName + ': ' + err.message);
+    }
+  }
+  return { cleanText, actionMessages, feedbackPayload };
+}
+
+// === Izuna Worker Direct Execution (Phase 8) ===
+// dispatch.py が worker track + agent を特定した場合、LLM をスキップして直接実行する
+
+interface DispatchResult {
+  track: string | null;
+  agent: string | null;
+  mode: string;
+  blast_radius?: string;
+  reason?: string;
+}
+
+/**
+ * チャンネル ID → 既定担当 worker agent のマッピング。
+ * このチャンネルで発言された時は、キーワードマッチを飛ばして直接この agent へ。
+ * #一般 のような「受付窓口」チャンネルはここに載せず、キーワード dispatch に任せる。
+ */
+/**
+ * CHANNEL_AGENT_MAP は state/channel_agent_map.json から動的に読み込む。
+ * `!skill agent=<name>` で更新可能。10 秒 cache。
+ */
+const CHANNEL_AGENT_MAP_FILE = pathJoin(
+  process.env.HOME || '/Users/suguru',
+  'projects/izuna-workspace/state/channel_agent_map.json'
+);
+type ChannelAgentMap = Record<string, { track: string; agent: string; name?: string }>;
+let _channelMapCache: ChannelAgentMap | null = null;
+let _channelMapCachedAt = 0;
+const CHANNEL_MAP_TTL_MS = 10_000;
+const CHANNEL_MAP_DEFAULTS: ChannelAgentMap = {
+  '1494288430656524360': { track: 'worker', agent: 'script-writer-agent', name: '#台本' },
+  '1492838930213503069': { track: 'worker', agent: 'mail-agent', name: '#mail' },
+  '1492839063059693568': { track: 'worker', agent: 'calendar-agent', name: '#schedule' },
+  '1492839607924953259': { track: 'worker', agent: 'social-agent', name: '#sns' },
+  '1492839921335930940': { track: 'dev', agent: 'dmat-keychain-agent', name: '#dev-dmatkc' },
+};
+
+function _readChannelMapFromDisk(): ChannelAgentMap | null {
+  if (!existsSync(CHANNEL_AGENT_MAP_FILE)) return null;
+  try {
+    const raw = readFileSync(CHANNEL_AGENT_MAP_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    // schema validation
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('channel_agent_map.json is not an object');
+    }
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof k !== 'string' || !v || typeof v !== 'object') {
+        throw new Error(`invalid entry for key ${k}`);
+      }
+      const ent = v as { track?: unknown; agent?: unknown };
+      if (typeof ent.track !== 'string' || typeof ent.agent !== 'string') {
+        throw new Error(`entry ${k}: track/agent must be string`);
+      }
+    }
+    return parsed as ChannelAgentMap;
+  } catch (err) {
+    console.error(
+      `[channel-map] ⚠️ parse/schema error in ${CHANNEL_AGENT_MAP_FILE}: ` +
+        (err instanceof Error ? err.message : String(err)) +
+        ' — using hard-coded defaults this run (file NOT overwritten).'
+    );
+    return null;
+  }
+}
+
+function loadChannelAgentMap(): ChannelAgentMap {
+  const now = Date.now();
+  if (_channelMapCache && now - _channelMapCachedAt < CHANNEL_MAP_TTL_MS) {
+    return _channelMapCache;
+  }
+  const disk = _readChannelMapFromDisk();
+  _channelMapCache = disk ?? { ...CHANNEL_MAP_DEFAULTS };
+  _channelMapCachedAt = now;
+  return _channelMapCache;
+}
+
+/**
+ * チャンネル 1 件だけ upsert/削除して atomic に保存。
+ * - save 前に必ず disk から再読込 (10s cache で stale にならない)
+ * - tmp file → rename で atomic write (partial write 防止)
+ * - 別 process/外部編集の変更を上書きしない
+ */
+function saveChannelAgentMapEntry(
+  channelId: string,
+  entry: { track: string; agent: string; name?: string } | null
+): void {
+  // 保存前に最新 disk 状態を取得
+  const current = _readChannelMapFromDisk() ?? { ...CHANNEL_MAP_DEFAULTS };
+  if (entry === null) {
+    delete current[channelId];
+  } else {
+    current[channelId] = entry;
+  }
+  // atomic write via tmp + rename
+  const tmp = CHANNEL_AGENT_MAP_FILE + '.tmp.' + process.pid;
+  try {
+    mkdirSync(pathDirname(CHANNEL_AGENT_MAP_FILE), { recursive: true });
+    writeFileSync(tmp, JSON.stringify(current, null, 2) + '\n', 'utf-8');
+    renameSync(tmp, CHANNEL_AGENT_MAP_FILE);
+    _channelMapCache = current;
+    _channelMapCachedAt = Date.now();
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
+}
+
+/** 有効な agent 名のリスト (dispatch.py::WORKER_AGENTS + DEV_AGENTS と同期) */
+const VALID_AGENTS = [
+  'mail-agent',
+  'calendar-agent',
+  'notion-manager',
+  'social-agent',
+  'media-agent',
+  'karte-agent',
+  'discord-admin-agent',
+  'script-writer-agent',
+  'voice-agent',
+  'video-agent',
+  'x-agent',
+  'dmat-keychain-agent',
+  'koereq-agent',
+  'nurseai-agent',
+  'hayabusa-agent',
+] as const;
+
+/** チャンネル既定 agent を返す。無ければ null。 */
+function channelDefaultDispatch(channelId: string | null | undefined): DispatchResult | null {
+  if (!channelId) return null;
+  const map = loadChannelAgentMap();
+  const preset = map[channelId];
+  if (!preset) return null;
+  return {
+    track: preset.track,
+    agent: preset.agent,
+    mode: 'telegram_confirm',
+    reason: 'channel_default',
+  };
+}
+
+/** Worker 簡易クエリの判定キーワード */
+const WORKER_AUTO_EXEC_PATTERNS: Record<string, { action: string; keywords: string[] }> = {
+  'mail-agent': {
+    // ユーザー方針: 未読メール巡回は不要。スター付きメールへの自動返信 draft が主務。
+    action: 'process_starred',
+    keywords: [
+      'スター',
+      'starred',
+      'star',
+      '★',
+      '🔖',
+      '返信書',
+      '返信して',
+      '下書き',
+      '確認して',
+      'チェック',
+    ],
+  },
+  'calendar-agent': {
+    action: 'calendar_list',
+    // "予定" は generic 過ぎて create 指示 ("予定登録して" "予定入れといて") と衝突する。
+    // 明示的な list 表現だけを短絡対象にする。create 意図は下記 CALENDAR_CREATE_HINTS で LLM に委譲。
+    keywords: ['確認', 'check', 'today', '今日', '一覧', 'リスト', 'チェック'],
+  },
+  'notion-manager': {
+    action: 'notion_tasks',
+    keywords: ['タスク', 'tasks', '一覧', '確認', 'リスト'],
+  },
+};
+
+/**
+ * Worker タスクの直接実行を試行する。
+ * 成功した場合はフォーマット済みテキストを返す。実行不要/失敗時は null。
+ */
+async function tryWorkerDirectExec(
+  dispatch: DispatchResult,
+  rawPrompt: string
+): Promise<string | null> {
+  if (dispatch.track !== 'worker' || !dispatch.agent) return null;
+
+  const pattern = WORKER_AUTO_EXEC_PATTERNS[dispatch.agent];
+  const forceMailChannel = dispatch.agent === 'mail-agent' && dispatch.reason === 'channel_default';
+  const forceScriptChannel =
+    dispatch.agent === 'script-writer-agent' && dispatch.reason === 'channel_default';
+  // pattern 未定義でも force 対象 agent なら続行
+  if (!pattern && !forceMailChannel && !forceScriptChannel) return null;
+
+  // キーワードマッチ: 簡易クエリ（確認/check系）のみ直接実行。
+  // ただし mail-agent/script-writer-agent は channel_default が効いている channel では
+  // 常に direct-exec を発火させる — Gemma4 の broken JSON action を回避するため。
+  const promptLower = rawPrompt.toLowerCase();
+  const isSimpleQuery = pattern
+    ? pattern.keywords.some((kw) => promptLower.includes(kw.toLowerCase()))
+    : false;
+
+  // calendar-agent: create 意図ワードが混ざっていたら list へ短絡せず LLM に委ねる
+  // (SOUL.md の `[ACTION:calendar_create ...]` 形式で summary/start/location を抽出させる)
+  if (dispatch.agent === 'calendar-agent') {
+    const CALENDAR_CREATE_HINTS = [
+      '登録',
+      '入れとい',
+      '入れて',
+      '入れといて',
+      '追加',
+      '予約',
+      'よろしく',
+      'おねがい',
+      'お願い',
+      'セット',
+      'ブッキング',
+      'schedule',
+      'create',
+      'add',
+      'book',
+    ];
+    const hasCreateIntent = CALENDAR_CREATE_HINTS.some((k) =>
+      promptLower.includes(k.toLowerCase())
+    );
+    if (hasCreateIntent) {
+      console.log('[izuna-worker-exec] calendar-agent: create intent detected → LLM fallback');
+      return null;
+    }
+  }
+
+  if (!isSimpleQuery && !forceMailChannel && !forceScriptChannel) return null;
+
+  console.log(`[izuna-worker-exec] Direct executing: ${dispatch.agent} → ${pattern.action}`);
+
+  try {
+    // 🎬 script-writer-agent + channel_default (#台本) 用 direct-exec
+    // Izuna LLM が type=outline を選んでしまう問題を回避し、**default は type=scene**。
+    // 「プロット」「あらすじ」「構成」等の明示キーワードがあった場合のみ outline に切替。
+    if (dispatch.agent === 'script-writer-agent' && dispatch.reason === 'channel_default') {
+      const txt = rawPrompt || '';
+      let stype = 'scene'; // 既定: 漫画台本シーン
+      if (/プロット|あらすじ|構成|3幕|三幕|ログライン/.test(txt)) {
+        stype = 'outline';
+      } else if (/キャラ設定|キャラクター設定|人物像/.test(txt)) {
+        stype = 'character';
+      } else if (/壁打ち|アイデア出し|切り口/.test(txt)) {
+        stype = 'brainstorm';
+      } else if (/なりきり|roleplay|ロールプレイ/.test(txt)) {
+        stype = 'roleplay';
+      }
+      console.log(
+        `[izuna-worker-exec] script_write direct: type=${stype} (from ${txt.length} chars prompt)`
+      );
+      const params = JSON.stringify({
+        type: stype,
+        project: 'manga',
+        prompt: txt.slice(0, 4000),
+      });
+      try {
+        const raw = await execPython(
+          ['action_executor.py', '--action', 'script_write', '--params', params],
+          240_000 // 4分 (Hayabusa 遅延対応)
+        );
+        const parsed = JSON.parse(raw);
+        if (parsed.ok) {
+          const file = parsed.file || '';
+          const content = parsed.content || '';
+          const preview =
+            content.length > 1800 ? content.slice(0, 1800) + '\n...(truncated)' : content;
+          return `✅ **${stype}** (${content.length} 字) を保存しました\nMEDIA:${file}\n\n---\n${preview}`;
+        }
+        return `⚠️ script_write 失敗: ${parsed.error || 'unknown'}`;
+      } catch (err) {
+        console.error('[izuna-worker-exec] script_write error:', err);
+        return `⚠️ script_write エラー: ${String(err).slice(0, 300)}`;
+      }
+    }
+
+    if (pattern.action === 'process_starred') {
+      // メール本文が貼り付けられたかどうかを判定 (連絡先マーカー複数ヒット or 長文)
+      const MAIL_BODY_MARKERS = [
+        /〒\d/,
+        /Fax\s*[:：]/i,
+        /℡/,
+        /電話\s*[:：]/,
+        /@[\w-]+\.[A-Za-z]{2,}/,
+        /^先生$/m,
+        /様\n/,
+        /・・・・・・・・/,
+      ];
+      const markerHits = MAIL_BODY_MARKERS.filter((r) => r.test(rawPrompt)).length;
+      const looksLikeMailBody = rawPrompt.length >= 150 && markerHits >= 2;
+
+      if (looksLikeMailBody) {
+        // 📝 貼り付けられたメール本文から Claude CLI で返信案生成
+        console.log(
+          `[izuna-worker-exec] Drafting from pasted mail body (${rawPrompt.length} chars, ${markerHits} markers)`
+        );
+        const result = await new Promise<string>((resolve, reject) => {
+          const child = execFile(
+            pathJoin(process.env.HOME || '/Users/suguru', 'venvs/izuna/bin/python3'),
+            [
+              pathJoin(
+                process.env.HOME || '/Users/suguru',
+                'projects/izuna-workspace/skills/mail-agent/draft_from_text.py'
+              ),
+            ],
+            {
+              timeout: 120_000,
+              cwd: pathJoin(
+                process.env.HOME || '/Users/suguru',
+                'projects/izuna-workspace/skills/mail-agent'
+              ),
+              env: {
+                ...process.env,
+                PYTHONPATH: pathJoin(
+                  process.env.HOME || '/Users/suguru',
+                  'projects/izuna-workspace/scripts'
+                ),
+              },
+            },
+            (err, stdout, stderr) => {
+              if (err) {
+                reject(new Error((stderr || err.message).slice(-400)));
+                return;
+              }
+              resolve(stdout);
+            }
+          );
+          // 本文を stdin に流す
+          if (child.stdin) {
+            child.stdin.write(rawPrompt);
+            child.stdin.end();
+          }
+        });
+        return (result || '').trim() || '⚠️ 返信案が空でした';
+      }
+
+      // 📧 スター付きメール → check_starred.py を直接実行
+      const result = await new Promise<string>((resolve, reject) => {
+        execFile(
+          pathJoin(process.env.HOME || '/Users/suguru', 'venvs/izuna/bin/python3'),
+          [
+            pathJoin(
+              process.env.HOME || '/Users/suguru',
+              'projects/izuna-workspace/skills/mail-agent/check_starred.py'
+            ),
+          ],
+          {
+            timeout: 120_000,
+            cwd: pathJoin(
+              process.env.HOME || '/Users/suguru',
+              'projects/izuna-workspace/skills/mail-agent'
+            ),
+            env: {
+              ...process.env,
+              PYTHONPATH: pathJoin(
+                process.env.HOME || '/Users/suguru',
+                'projects/izuna-workspace/scripts'
+              ),
+            },
+          },
+          (err, stdout, stderr) => {
+            if (err) {
+              reject(new Error((stderr || err.message).slice(-400)));
+              return;
+            }
+            resolve(stdout);
+          }
+        );
+      });
+      const out = (result || '').trim();
+      return (
+        out || '⭐ スター付きメールを処理しました。新規ドラフトがあれば Gmail を確認してください。'
+      );
+    }
+
+    if (pattern.action === 'calendar_list' || pattern.action === 'notion_tasks') {
+      // action_executor.py 経由で実行
+      const result = await new Promise<string>((resolve, reject) => {
+        execFile(
+          'python3',
+          [
+            pathJoin(ACTION_SCRIPTS_DIR, 'action_executor.py'),
+            '--action',
+            pattern.action,
+            '--params',
+            '{}',
+          ],
+          {
+            timeout: 15000,
+            cwd: ACTION_SCRIPTS_DIR,
+            env: {
+              ...process.env,
+              PYTHONPATH: '/Users/suguru/Library/Python/3.9/lib/python/site-packages',
+            },
+          },
+          (err, stdout, stderr) => {
+            if (err) {
+              reject(new Error(stderr || err.message));
+              return;
+            }
+            resolve(stdout);
+          }
+        );
+      });
+
+      const parsed = JSON.parse(result);
+      if (!parsed.ok) return null; // LLM にフォールバック
+
+      if (pattern.action === 'calendar_list') {
+        const events = parsed.events || [];
+        if (events.length === 0) return '📅 今後の予定はありません。';
+        const lines = events.map(
+          (e: { start: string; summary: string }) => `- ${e.start}  ${e.summary}`
+        );
+        return `📅 **予定一覧**\n${lines.join('\n')}`;
+      }
+
+      if (pattern.action === 'notion_tasks') {
+        const tasks = parsed.tasks || [];
+        if (tasks.length === 0) return '📋 タスクはありません。';
+        const lines = tasks.map(
+          (t: { title?: string; status?: string; name?: string }) =>
+            `- ${t.title || t.name || '(無題)'}${t.status ? ` [${t.status}]` : ''}`
+        );
+        return `📋 **タスク一覧**\n${lines.join('\n')}`;
+      }
+    }
+  } catch (err) {
+    console.error(
+      `[izuna-worker-exec] Direct exec failed (fallback to LLM):`,
+      err instanceof Error ? err.message : err
+    );
+    return null; // LLM にフォールバック
+  }
+
+  return null;
+}
+
+// === Izuna Dev Agent Spawning (Phase 9) ===
+// dispatch.py が dev track を特定した場合、Claude Code を対象リポにスコープしてスポーン
+
+/** Dev エージェント → リポジトリパスのマッピング */
+const DEV_AGENT_REPOS: Record<string, string> = {
+  'dmat-keychain-agent': pathJoin(process.env.HOME || '', 'projects/dmat-keychain'),
+  'koereq-agent': pathJoin(process.env.HOME || '', 'projects/koereq'),
+  'nurseai-agent': pathJoin(process.env.HOME || '', 'projects/nurseai'),
+  'hayabusa-agent': pathJoin(process.env.HOME || '', 'projects/hayabusa'),
+};
+
+/**
+ * Dev タスクに対して Claude Code をスポーンし、結果を返す。
+ * 対象リポが見つからない場合は null（LLM フォールバック）。
+ */
+async function spawnDevAgent(
+  dispatch: DispatchResult,
+  prompt: string,
+  channelId: string,
+  config: ReturnType<typeof loadConfig>
+): Promise<string | null> {
+  if (dispatch.track !== 'dev' || !dispatch.agent) return null;
+
+  const repoPath = DEV_AGENT_REPOS[dispatch.agent];
+  if (!repoPath) {
+    console.warn(`[izuna-dev-agent] Unknown dev agent: ${dispatch.agent}`);
+    return null;
+  }
+
+  // リポジトリの存在チェック
+  try {
+    const { statSync } = await import('fs');
+    if (!statSync(repoPath).isDirectory()) {
+      console.warn(`[izuna-dev-agent] Repo not found: ${repoPath}`);
+      return null;
+    }
+  } catch {
+    console.warn(`[izuna-dev-agent] Repo not accessible: ${repoPath}`);
+    return null;
+  }
+
+  console.log(`[izuna-dev-agent] Spawning Claude Code for ${dispatch.agent} in ${repoPath}`);
+
+  // Claude Code を対象リポにスコープしてワンショット実行
+  const devRunner = new ClaudeCodeRunner({
+    model: config.agent.config.model,
+    timeoutMs: config.agent.config.timeoutMs ?? 300000,
+    workdir: repoPath,
+    skipPermissions: config.agent.config.skipPermissions ?? false,
+    platform: config.agent.platform,
+  });
+
+  const devPrompt = `[Dev Agent: ${dispatch.agent}]\n[Repo: ${repoPath}]\n[Blast Radius: ${dispatch.blast_radius || 'unknown'}]\n\n${prompt}`;
+
+  const result = await devRunner.run(devPrompt, { channelId });
+  return result.result;
+}
+
+// === dev-izuna 自動開発チャンネル ===
+// dev-izuna に自然文でタスクを書くと、NikoToRA/<repo> を clone → claude -p で開発 → main に push
+const DEV_IZUNA_CHANNEL_ID = '1492838995024150588';
+const CLAUDE_DEV_SCRIPT = pathJoin(
+  process.env.HOME || '/Users/suguru',
+  'projects/izuna-workspace/scripts/claude_dev.py'
+);
+
+interface ClaudeDevOutput {
+  ok: boolean;
+  active?: boolean;
+  stage?: string;
+  message?: string;
+}
+
+function runClaudeDevSync(args: string[], timeoutMs = 60_000): Promise<ClaudeDevOutput> {
+  return new Promise((resolve) => {
+    const proc = spawnProc('python3', [CLAUDE_DEV_SCRIPT, ...args], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => proc.kill('SIGTERM'), timeoutMs);
+    proc.stdout.on('data', (d) => (stdout += d.toString()));
+    proc.stderr.on('data', (d) => (stderr += d.toString()));
+    proc.on('close', () => {
+      clearTimeout(timer);
+      const lines = stdout.trim().split('\n').filter(Boolean);
+      const last = lines[lines.length - 1];
+      if (!last) {
+        resolve({ ok: false, message: `(no output) stderr=${stderr.slice(-400)}` });
+        return;
+      }
+      try {
+        resolve(JSON.parse(last) as ClaudeDevOutput);
+      } catch {
+        resolve({ ok: false, message: stdout.slice(-1500) });
+      }
+    });
+    proc.on('error', (e) => {
+      clearTimeout(timer);
+      resolve({ ok: false, message: `spawn error: ${e.message}` });
+    });
+  });
+}
+
+async function postChunked(channel: any, text: string): Promise<void> {
+  if (!text) return;
+  const max = 1900;
+  if (text.length <= max) {
+    await channel.send(text).catch((e: any) => console.error('[dev-izuna] send:', e));
+    return;
+  }
+  for (let i = 0; i < text.length; i += max) {
+    await channel
+      .send(text.slice(i, i + max))
+      .catch((e: any) => console.error('[dev-izuna] send:', e));
+  }
+}
+
+async function handleDevIzunaMessage(message: Message): Promise<void> {
+  const ch: any = message.channel;
+  if (!ch || typeof ch.send !== 'function') return;
+
+  const raw = message.content
+    .replace(/<@[!&]?\d+>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!raw) return;
+
+  // special ops
+  if (raw === '!cancel' || raw === '/cancel' || raw === 'キャンセル') {
+    const r = await runClaudeDevSync(['cancel']);
+    await ch.send(r.message || '(cancel)');
+    return;
+  }
+  if (raw === '!status' || raw === '/status' || raw === 'ステータス') {
+    const r = await runClaudeDevSync(['status']);
+    await ch.send(r.message || '(status)');
+    return;
+  }
+
+  const status = await runClaudeDevSync(['status']);
+  const stage = status.stage;
+
+  if (!status.active) {
+    const r = await runClaudeDevSync(['start', raw]);
+    await postChunked(ch, r.message || '(no response)');
+    return;
+  }
+
+  if (stage === 'awaiting_confirm' || stage === 'awaiting_repo') {
+    // raw input は python 側で番号/肯定語/リポ名 を解釈する
+    const choice = raw.trim();
+    if (!choice) {
+      await ch.send('⚠️ 候補番号 (1-3) / 👍 / はい / リポ名 のいずれかを送ってください');
+      return;
+    }
+    await ch.send(`🔨 確定: \`${choice}\` → 開発開始します…完了時にここへ結果を投稿します。`);
+
+    const proc = spawnProc('python3', [CLAUDE_DEV_SCRIPT, 'resume', choice], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: false,
+    });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => (stdout += d.toString()));
+    proc.stderr.on('data', (d) => (stderr += d.toString()));
+    proc.on('close', async (code) => {
+      try {
+        const lines = stdout.trim().split('\n').filter(Boolean);
+        const last = lines[lines.length - 1];
+        let msg = '(no output)';
+        if (last) {
+          try {
+            const parsed = JSON.parse(last) as ClaudeDevOutput;
+            msg = parsed.message || JSON.stringify(parsed);
+          } catch {
+            msg = stdout.slice(-1800);
+          }
+        } else if (stderr) {
+          msg = `(stderr)\n${stderr.slice(-1500)}`;
+        }
+        if (code !== 0 && !msg.includes('❌')) {
+          msg = `⚠️ exit code ${code}\n${msg}`;
+        }
+        await postChunked(ch, msg);
+      } catch (e) {
+        console.error('[dev-izuna] post-run error:', e);
+      }
+    });
+    proc.on('error', async (e) => {
+      console.error('[dev-izuna] spawn error:', e);
+      await ch.send(`❌ python3 起動失敗: ${e.message}`).catch(() => {});
+    });
+    return;
+  }
+
+  if (stage === 'running') {
+    await ch.send(`⏳ 他の開発が進行中です。\n${status.message || ''}\n\n中止するには \`!cancel\``);
+    return;
+  }
+}
+
+// === Phase 10: Magika Guard Hook ===
+// パッケージインストールやファイル添付時にセキュリティチェックを実行
+
+const INSTALL_KEYWORDS = [
+  'install',
+  'インストール',
+  'pip install',
+  'npm install',
+  'brew install',
+  '追加',
+  '入れて',
+  '使いたい',
+  'add dependency',
+  'require',
+  'import',
+];
+
+/** インストール系キーワードがメッセージに含まれるか判定 */
+function containsInstallKeyword(text: string): boolean {
+  const lower = text.toLowerCase();
+  return INSTALL_KEYWORDS.some((kw) => lower.includes(kw.toLowerCase()));
+}
+
+/** メッセージからパッケージマネージャとパッケージ名を抽出 */
+function extractPackageInfo(text: string): { manager: string; packageName: string } | null {
+  const patterns: { re: RegExp; manager: string }[] = [
+    { re: /pip\s+install\s+([a-zA-Z0-9_.-]+)/i, manager: 'pip' },
+    { re: /npm\s+install\s+([a-zA-Z0-9@/_.-]+)/i, manager: 'npm' },
+    { re: /brew\s+install\s+([a-zA-Z0-9_.-]+)/i, manager: 'brew' },
+    { re: /yarn\s+add\s+([a-zA-Z0-9@/_.-]+)/i, manager: 'yarn' },
+    { re: /pnpm\s+add\s+([a-zA-Z0-9@/_.-]+)/i, manager: 'pnpm' },
+    { re: /cargo\s+add\s+([a-zA-Z0-9_.-]+)/i, manager: 'cargo' },
+    { re: /gem\s+install\s+([a-zA-Z0-9_.-]+)/i, manager: 'gem' },
+  ];
+  for (const { re, manager } of patterns) {
+    const m = text.match(re);
+    if (m) return { manager, packageName: m[1] };
+  }
+  return null;
+}
+
+/** magika_guard.py scan でファイルをチェック */
+async function checkWithMagika(
+  target: string,
+  expectedType?: string
+): Promise<{
+  verdict: string;
+  reason: string | null;
+  detected_type: string;
+}> {
+  return new Promise((resolve) => {
+    const args = ['magika_guard.py', 'scan', target];
+    if (expectedType) args.push('--expected', expectedType);
+    execFile(
+      'python3',
+      args,
+      { timeout: 15000, cwd: ACTION_SCRIPTS_DIR, env: ACTION_ENV },
+      (err, stdout) => {
+        if (err) {
+          resolve({ verdict: 'error', reason: err.message, detected_type: 'unknown' });
+          return;
+        }
+        try {
+          resolve(JSON.parse(stdout));
+        } catch {
+          resolve({ verdict: 'error', reason: 'parse error', detected_type: 'unknown' });
+        }
+      }
+    );
+  });
+}
+
+/** magika_guard.py check-package でパッケージをチェック */
+async function checkPackageWithMagika(
+  manager: string,
+  packageName: string
+): Promise<{
+  verdict: string;
+  reason: string | null;
+  details: any;
+}> {
+  return new Promise((resolve) => {
+    execFile(
+      'python3',
+      ['magika_guard.py', 'check-package', manager, packageName],
+      { timeout: 30000, cwd: ACTION_SCRIPTS_DIR, env: ACTION_ENV },
+      (err, stdout) => {
+        if (err) {
+          resolve({ verdict: 'error', reason: err.message, details: {} });
+          return;
+        }
+        try {
+          resolve(JSON.parse(stdout));
+        } catch {
+          resolve({ verdict: 'error', reason: 'parse error', details: {} });
+        }
+      }
+    );
+  });
+}
+
+/** Magika verdict をユーザー向けメッセージに変換（safe は null = 表示なし） */
+function formatMagikaVerdict(verdict: string, reason: string | null, label: string): string | null {
+  if (verdict === 'safe') return null;
+  if (verdict === 'blocked') {
+    return `\u{1f6ab} **セキュリティブロック** [${label}]: ${reason || '安全性を確認できませんでした'}`;
+  }
+  if (verdict === 'suspicious') {
+    return `\u26a0\ufe0f **セキュリティ警告** [${label}]: ${reason || '注意が必要です'}`;
+  }
+  // error or unknown
+  return null;
+}
+
+/** LLM応答内のインストールコマンドを抽出して全パッケージ情報を返す */
+function extractInstallCommandsFromResponse(
+  text: string
+): { manager: string; packageName: string }[] {
+  const results: { manager: string; packageName: string }[] = [];
+  const patterns: { re: RegExp; manager: string }[] = [
+    { re: /pip\s+install\s+([a-zA-Z0-9_.-]+)/gi, manager: 'pip' },
+    { re: /npm\s+install\s+([a-zA-Z0-9@/_.-]+)/gi, manager: 'npm' },
+    { re: /brew\s+install\s+([a-zA-Z0-9_.-]+)/gi, manager: 'brew' },
+    { re: /yarn\s+add\s+([a-zA-Z0-9@/_.-]+)/gi, manager: 'yarn' },
+    { re: /pnpm\s+add\s+([a-zA-Z0-9@/_.-]+)/gi, manager: 'pnpm' },
+    { re: /cargo\s+add\s+([a-zA-Z0-9_.-]+)/gi, manager: 'cargo' },
+    { re: /gem\s+install\s+([a-zA-Z0-9_.-]+)/gi, manager: 'gem' },
+  ];
+  for (const { re, manager } of patterns) {
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const pkgName = m[1];
+      if (!results.some((r) => r.manager === manager && r.packageName === pkgName)) {
+        results.push({ manager, packageName: pkgName });
+      }
+    }
+  }
+  return results;
+}
+
+// === Izuna Topic Router (Phase 5) ===
+const TOPIC_CHANNELS: Record<string, string> = {
+  mail: '1492838930213503069',
+  'dev-izuna': '1492838995024150588',
+  schedule: '1492839063059693568',
+  'harness-gate': '1492839143636734013',
+  'audit-log': '1492839299933278289',
+  sns: '1492839607924953259',
+  'dev-dmatkc': '1492839921335930940',
+};
+const GENERAL_TEXT_CHANNEL_ID = '1492792411204882535';
+const HANDOFF_EMOJI = '🧭';
+
+function isClaudeDevChannel(channelId: string): boolean {
+  return (process.env.CLAUDE_DEV_CHANNEL_IDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .includes(channelId);
+}
+
+function buildRecallFriendlyDevMemory(prompt: string, result: string): string {
+  const compact = (s: string, max: number) =>
+    s.replace(ACTION_HOOK_RE, '').replace(/\s+/g, ' ').trim().slice(0, max);
+  const commits = [...result.matchAll(/\b[0-9a-f]{7,12}\b/g)]
+    .map((m) => m[0])
+    .filter((sha, idx, arr) => arr.indexOf(sha) === idx)
+    .slice(0, 5);
+  const fileMentions = [
+    ...result.matchAll(/(?:[\w.-]+\/)+[\w.-]+\.(?:ts|js|py|md|json|yml|yaml|plist)/g),
+  ]
+    .map((m) => m[0])
+    .filter((file, idx, arr) => arr.indexOf(file) === idx)
+    .slice(0, 8);
+  return [
+    '[recall_key] claude_dev self_mod discord_policy programming_change izuna_secretary_loop',
+    `[user_intent] ${compact(prompt, 500)}`,
+    `[outcome] ${compact(result, 900)}`,
+    commits.length ? `[commits] ${commits.join(', ')}` : '[commits] none_detected',
+    fileMentions.length ? `[artifacts] ${fileMentions.join(', ')}` : '[artifacts] none_detected',
+    '[next_recall_hint] この記憶は、Discord上の方針変更がプログラム/プロンプト/設定変更へ反映された経緯を思い出すためのもの。',
+  ].join('\n');
+}
+
+function extractArtifactMentions(text: string): string[] {
+  return [
+    ...text.matchAll(/(?:[\w.-]+\/)+[\w.-]+\.(?:ts|js|py|md|json|yml|yaml|plist|txt|html|css)/g),
+  ]
+    .map((m) => m[0])
+    .filter((file, idx, arr) => arr.indexOf(file) === idx)
+    .slice(0, 12);
+}
+
+function recordAgentBusTask(params: {
+  prompt: string;
+  dispatch: DispatchResult;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  result?: string;
+  channelId: string;
+  source?: string;
+  remember?: boolean;
+  metadata?: Record<string, unknown>;
+}): void {
+  try {
+    const route = params.dispatch.track || 'llm';
+    const agent = params.dispatch.agent || '';
+    const result = params.result || '';
+    const artifacts = extractArtifactMentions(result);
+    const args = [
+      pathJoin(ACTION_SCRIPTS_DIR, 'agent_bus.py'),
+      'record',
+      '--user-intent',
+      params.prompt.slice(0, 4000),
+      '--route',
+      route,
+      '--agent',
+      agent,
+      '--status',
+      params.status,
+      '--result',
+      result.slice(0, 4000),
+      '--artifacts',
+      JSON.stringify(artifacts),
+      '--source',
+      params.source || 'discord',
+      '--session-id',
+      params.channelId,
+      '--metadata',
+      JSON.stringify({
+        mode: params.dispatch.mode,
+        blast_radius: params.dispatch.blast_radius || null,
+        reason: params.dispatch.reason || null,
+        ...params.metadata,
+      }),
+    ];
+    const shouldRemember = params.remember ?? params.status === 'completed';
+    if (shouldRemember) {
+      args.push('--remember');
+    }
+    execFile(
+      'python3',
+      args,
+      { timeout: 7000, cwd: ACTION_SCRIPTS_DIR },
+      (err, _stdout, stderr) => {
+        if (err) console.error('[izuna-agent-bus] record error:', stderr || err.message);
+        else console.log(`[izuna-agent-bus] recorded ${route}/${agent || 'unassigned'}`);
+      }
+    );
+  } catch (err) {
+    console.error('[izuna-agent-bus] hook error:', err);
+  }
+}
+
+type ConversationMemoryKind =
+  | 'conversation'
+  | 'worker_exec'
+  | 'dev_task'
+  | 'cancelled'
+  | 'error'
+  | 'fast_path';
+
+interface ConversationMemoryParams {
+  channelId: string;
+  prompt: string;
+  result: string;
+  kind: ConversationMemoryKind;
+  agent?: string;
+  metadata?: Record<string, unknown>;
+}
+
+function recordConversationMemory(params: ConversationMemoryParams): void {
+  try {
+    if (!params.prompt || params.prompt.trim().length < 1) return;
+    const isDev = isClaudeDevChannel(params.channelId);
+    const cleanResp = (params.result || '').replace(ACTION_HOOK_RE, '').trim();
+    const headerKind = isDev ? 'dev_task' : params.kind;
+    let content: string;
+    if (isDev) {
+      content = buildRecallFriendlyDevMemory(params.prompt, cleanResp);
+    } else {
+      const respLabel =
+        params.kind === 'worker_exec'
+          ? `[worker:${params.agent || 'direct'}]`
+          : params.kind === 'dev_task'
+            ? `[dev-agent:${params.agent || 'unknown'}]`
+            : params.kind === 'fast_path'
+              ? `[fast-path:${params.agent || 'unknown'}]`
+              : params.kind === 'cancelled'
+                ? '[cancelled]'
+                : params.kind === 'error'
+                  ? '[error]'
+                  : '[assistant]';
+      const userBudget = params.kind === 'cancelled' || params.kind === 'error' ? 600 : 300;
+      const respBudget = params.kind === 'worker_exec' || params.kind === 'fast_path' ? 700 : 500;
+      content = `[user] ${params.prompt.slice(0, userBudget)}\n${respLabel} ${cleanResp.slice(0, respBudget)}`;
+    }
+    const args = [
+      pathJoin(ACTION_SCRIPTS_DIR, 'memory_curator.py'),
+      'record',
+      '--agent',
+      isDev ? 'claude_dev' : params.agent || 'izuna',
+      '--type',
+      headerKind,
+      '--content',
+      content,
+      '--source-type',
+      'discord',
+      '--session-id',
+      params.channelId,
+    ];
+    if (isDev) {
+      args.push(
+        '--impact',
+        'architecture',
+        '--tags',
+        'claude_dev',
+        'self_mod',
+        'secretary_loop',
+        'discord_policy'
+      );
+    } else if (params.kind === 'cancelled' || params.kind === 'error') {
+      args.push('--tags', 'incomplete', params.kind);
+    }
+    execFile(
+      'python3',
+      args,
+      { timeout: 5000, cwd: ACTION_SCRIPTS_DIR },
+      (err, _stdout, stderr) => {
+        if (err)
+          console.error(`[izuna-memory] L1 record error (${params.kind}):`, stderr || err.message);
+        else console.log(`[izuna-memory] L1 recorded (${params.kind})`);
+      }
+    );
+  } catch (err) {
+    console.error('[izuna-memory] hook error:', err);
+  }
+}
+
+const TOPIC_KEYWORDS: Record<string, string[]> = {
+  mail: [
+    '\u30e1\u30fc\u30eb',
+    'mail',
+    '\u9001\u4fe1',
+    '\u8fd4\u4fe1',
+    'draft',
+    '\u4e0b\u66f8\u304d',
+  ],
+  schedule: [
+    '\u4e88\u5b9a',
+    '\u30ab\u30ec\u30f3\u30c0\u30fc',
+    '\u4f1a\u8b70',
+    'MTG',
+    '\u9762\u8ac7',
+    '\u660e\u65e5',
+    '\u4eca\u9031',
+  ],
+  'dev-izuna': [
+    '\u30b3\u30fc\u30c9',
+    '\u30ea\u30dd',
+    'commit',
+    'PR',
+    'bug',
+    '\u5b9f\u88c5',
+    '\u4fee\u6b63',
+    'koereq',
+    'nurseai',
+  ],
+  'dev-dmatkc': ['dmat', 'DMAT', '\u30ad\u30fc\u30db\u30eb\u30c0\u30fc', 'EC\u30b5\u30a4\u30c8'],
+  sns: ['\u6295\u7a3f', 'SNS', 'X', 'Qiita', '\u30d6\u30ed\u30b0'],
+};
+
+function classifyTopic(userMsg: string, botResp: string): { topic: string; channelId: string } {
+  const combined = (userMsg + ' ' + botResp).toLowerCase();
+
+  // ACTION marker check
+  const actionMatch = botResp.match(/\[ACTION:(\w+)/);
+  if (actionMatch) {
+    const actionMap: Record<string, string> = {
+      calendar_create: 'schedule',
+      calendar_list: 'schedule',
+      calendar_delete: 'schedule',
+      gmail_draft: 'mail',
+      gmail_context: 'mail',
+      mail_process: 'mail',
+    };
+    const topic = actionMap[actionMatch[1]];
+    if (topic && TOPIC_CHANNELS[topic]) {
+      return { topic, channelId: TOPIC_CHANNELS[topic] };
+    }
+  }
+
+  // Keyword match
+  let bestTopic = '';
+  let bestScore = 0;
+  for (const [topic, keywords] of Object.entries(TOPIC_KEYWORDS)) {
+    const score = keywords.filter((kw) => combined.includes(kw.toLowerCase())).length;
+    if (score > bestScore) {
+      bestScore = score;
+      bestTopic = topic;
+    }
+  }
+
+  if (bestTopic && bestScore > 0 && TOPIC_CHANNELS[bestTopic]) {
+    return { topic: bestTopic, channelId: TOPIC_CHANNELS[bestTopic] };
+  }
+  return { topic: 'general', channelId: '' };
+}
 
 /** メッセージを指定文字数で分割（カスタムセパレータ対応、デフォルトは行単位） */
 function splitMessage(text: string, maxLength: number, separator: string = '\n'): string[] {
@@ -96,9 +1558,6 @@ function getTypeLabel(
   }
 }
 
-// チャンネルごとの最後に送信したボットメッセージID
-const lastSentMessageIds = new Map<string, string>();
-
 /** 処理中に表示するStopボタン */
 function createStopButton(): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -119,13 +1578,21 @@ function createCompletedButtons(): ActionRowBuilder<ButtonBuilder> {
 function formatToolInput(toolName: string, input: Record<string, unknown>): string {
   switch (toolName) {
     case 'Read':
-      return input.file_path ? `: ${String(input.file_path).split('/').slice(-2).join('/')}` : '';
+    case 'read':
+      return input.file_path || input.path
+        ? `: ${String(input.file_path || input.path)
+            .split('/')
+            .slice(-2)
+            .join('/')}`
+        : '';
     case 'Edit':
     case 'Write':
       return input.file_path ? `: ${String(input.file_path).split('/').slice(-2).join('/')}` : '';
-    case 'Bash': {
-      if (!input.command) return '';
-      const cmd = String(input.command);
+    case 'Bash':
+    case 'exec': {
+      const cmdKey = input.command || input.cmd;
+      if (!cmdKey) return '';
+      const cmd = String(cmdKey);
       const cmdDisplay = `: \`${cmd.slice(0, 60)}${cmd.length > 60 ? '...' : ''}\``;
       const ghBadge = cmd.startsWith('gh ') && isGitHubAppEnabled() ? ' 🔑App' : '';
       return cmdDisplay + ghBadge;
@@ -135,6 +1602,7 @@ function formatToolInput(toolName: string, input: Record<string, unknown>): stri
     case 'Grep':
       return input.pattern ? `: ${String(input.pattern)}` : '';
     case 'WebFetch':
+    case 'web_fetch':
       return input.url ? `: ${String(input.url).slice(0, 60)}` : '';
     case 'Agent':
       return input.description ? `: ${String(input.description)}` : '';
@@ -152,7 +1620,54 @@ function formatToolInput(toolName: string, input: Record<string, unknown>): stri
   }
 }
 
+import { fileURLToPath } from 'node:url';
+const __ESM_FILE = fileURLToPath(import.meta.url);
+const __ESM_DIR = pathJoin(__ESM_FILE, '..');
+
+function getGitShortSha(): string {
+  try {
+    return execSync('git rev-parse HEAD', { cwd: pathJoin(__ESM_DIR, '..') })
+      .toString()
+      .trim()
+      .slice(0, 7);
+  } catch {
+    return 'unknown';
+  }
+}
+
+function assertDistFresh(): void {
+  const srcDir = pathJoin(__ESM_DIR, '..', 'src');
+  const srcIndex = pathJoin(srcDir, 'index.ts');
+  const distIndex = __ESM_FILE;
+  const gitSha = getGitShortSha();
+  try {
+    const srcStat = statSync(srcIndex);
+    const distStat = statSync(distIndex);
+    if (srcStat.mtimeMs > distStat.mtimeMs) {
+      const delta = Math.round((srcStat.mtimeMs - distStat.mtimeMs) / 1000);
+      console.error(
+        '[FATAL] dist stale: src/index.ts is ' +
+          delta +
+          's newer than dist/index.js. Run npm run build and restart. git=' +
+          gitSha
+      );
+      process.exit(1);
+    }
+    console.log(
+      '[startup] build check OK: git=' +
+        gitSha +
+        ' dist=' +
+        new Date(distStat.mtimeMs).toISOString() +
+        ' src=' +
+        new Date(srcStat.mtimeMs).toISOString()
+    );
+  } catch (e) {
+    console.error('[startup] build check skipped (dev mode?):', (e as Error).message);
+  }
+}
+
 async function main() {
+  assertDistFresh();
   const config = loadConfig();
 
   // 許可リストのチェック（"*" で全員許可、カンマ区切りで複数ユーザー対応）
@@ -183,14 +1698,18 @@ async function main() {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.DirectMessages,
+      GatewayIntentBits.GuildMessageReactions,
+      GatewayIntentBits.DirectMessageReactions,
       GatewayIntentBits.MessageContent,
     ],
+    // DM / uncached message の reaction 等を受けるために必要
+    partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User],
   });
 
-  // エージェントランナーを作成
-  const agentRunner = createAgentRunner(config.agent.backend, config.agent.config, {
-    platform: config.agent.platform,
-  });
+  // バックエンドリゾルバー & 動的ランナーマネージャーを作成
+  const resolver = new BackendResolver(config);
+  const agentRunner = new DynamicRunnerManager(config, resolver);
   const backendName = getBackendDisplayName(config.agent.backend);
   console.log(
     `[xangi] Using ${backendName} as agent backend (platform: ${config.agent.platform ?? 'all'})`
@@ -210,12 +1729,30 @@ async function main() {
   const dataDir = process.env.DATA_DIR || join(workdir, '.xangi');
   const scheduler = new Scheduler(dataDir);
 
+  // PIDファイル書き出し（xangi-cmd system_restart からシグナルで再起動するため）
+  const pidFilePath = join(dataDir, 'xangi.pid');
+  try {
+    writeFileSync(pidFilePath, String(process.pid));
+  } catch (err) {
+    console.warn(`[xangi] Failed to write PID file: ${err}`);
+  }
+
   // セッション永続化を初期化
   initSessions(dataDir);
 
-  // GitHub認証を初期化
+  // WebチャットUI起動
+  if (process.env.WEB_CHAT_ENABLED === 'true') {
+    startWebChat({ agentRunner });
+  }
+
+  // GitHub認証を初期化（秘密鍵をメモリに読み込む）
   const { initGitHubAuth } = await import('./github-auth.js');
   initGitHubAuth();
+
+  // ツール承認の有効/無効（デフォルト無効）
+  if (process.env.APPROVAL_ENABLED === 'true') {
+    setApprovalEnabled(true);
+  }
 
   // スラッシュコマンド定義
   const commands: ReturnType<SlashCommandBuilder['toJSON']>[] = [
@@ -274,7 +1811,56 @@ async function main() {
           )
       )
       .toJSON(),
+    new SlashCommandBuilder()
+      .setName('backend')
+      .setDescription('バックエンド/モデルの切り替え')
+      .addSubcommand((sub) => sub.setName('show').setDescription('現在のバックエンド設定を表示'))
+      .addSubcommand((sub) =>
+        sub
+          .setName('set')
+          .setDescription('バックエンド/モデルを設定')
+          .addStringOption((opt) =>
+            opt
+              .setName('type')
+              .setDescription('バックエンド名')
+              .setRequired(true)
+              .addChoices(
+                { name: 'Claude Code', value: 'claude-code' },
+                { name: 'Codex', value: 'codex' },
+                { name: 'Gemini', value: 'gemini' },
+                { name: 'Local LLM', value: 'local-llm' }
+              )
+          )
+          .addStringOption((opt) => opt.setName('model').setDescription('モデル名'))
+          .addStringOption((opt) =>
+            opt
+              .setName('effort')
+              .setDescription('effortレベル（Claude Code用）')
+              .addChoices(
+                { name: 'デフォルト', value: 'none' },
+                { name: 'low', value: 'low' },
+                { name: 'medium', value: 'medium' },
+                { name: 'high', value: 'high' },
+                { name: 'max', value: 'max' }
+              )
+          )
+      )
+      .addSubcommand((sub) => sub.setName('reset').setDescription('デフォルトに戻す'))
+      .addSubcommand((sub) =>
+        sub.setName('list').setDescription('利用可能なバックエンド一覧を表示')
+      )
+      .toJSON(),
   ];
+
+  // ALLOW_AUTOREPLY_COMMAND=true の場合のみコマンドを登録
+  if (config.discord.allowAutoreplyCommand) {
+    commands.push(
+      new SlashCommandBuilder()
+        .setName('autoreply')
+        .setDescription('このチャンネルのメンションなし応答を切り替え')
+        .toJSON()
+    );
+  }
 
   // 各スキルを個別のスラッシュコマンドとして追加
   for (const skill of skills) {
@@ -302,6 +1888,46 @@ async function main() {
   // スラッシュコマンド登録
   client.once(Events.ClientReady, async (c) => {
     console.log(`[xangi] Ready! Logged in as ${c.user.tag}`);
+
+    // ツール承認サーバー起動（Claude Code PreToolUseフック用）
+    const { startApprovalServer } = await import('./approval-server.js');
+    startApprovalServer(async (toolName, toolInput, dangerDescription) => {
+      // 最初のauto-replyチャンネルに承認メッセージを送信
+      const approvalChannelId = config.discord.autoReplyChannels?.[0];
+      if (!approvalChannelId) return true; // チャンネル未設定なら許可
+      const channel = c.channels.cache.get(approvalChannelId);
+      if (!channel || !('send' in channel)) return true;
+
+      const command =
+        toolName === 'Bash'
+          ? String((toolInput as Record<string, unknown>).command || '').slice(0, 200)
+          : `${toolName}: ${String((toolInput as Record<string, unknown>).file_path || '')}`;
+
+      return requestApproval(
+        approvalChannelId,
+        { command, matches: dangerDescription },
+        (approvalId, danger) => {
+          const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`xangi_approve_${approvalId}`)
+              .setLabel('許可')
+              .setStyle(ButtonStyle.Success),
+            new ButtonBuilder()
+              .setCustomId(`xangi_deny_${approvalId}`)
+              .setLabel('拒否')
+              .setStyle(ButtonStyle.Danger)
+          );
+          (channel as unknown as { send: (opts: unknown) => Promise<unknown> }).send({
+            content: `⚠️ **危険なコマンドを検知**\n\`\`\`\n${danger.command}\n\`\`\`\n${danger.matches.join(', ')}\n\n2分以内に応答がなければ自動拒否`,
+            components: [row],
+          });
+        }
+      );
+    });
+
+    // ツールサーバー起動（Claude Codeからcurlで叩くAPI）
+    const { startToolServer } = await import('./tool-server.js');
+    startToolServer();
 
     const rest = new REST({ version: '10' }).setToken(config.discord.token);
     try {
@@ -371,6 +1997,131 @@ async function main() {
         return;
       }
 
+      // === Gate approval/deny buttons (Phase 4b) ===
+      if (interaction.customId.startsWith('gate_approve_')) {
+        const token = interaction.customId.replace('gate_approve_', '');
+        const gate = pendingGates.get(token);
+        if (!gate) {
+          await interaction.reply({
+            content:
+              '\u26a0\ufe0f \u30b2\u30fc\u30c8\u304c\u671f\u9650\u5207\u308c\u307e\u305f\u306f\u5b58\u5728\u3057\u307e\u305b\u3093',
+            ephemeral: true,
+          });
+          return;
+        }
+        await interaction.deferUpdate().catch(() => {});
+
+        // gate_responder に "ok" を送る
+        const resp = await respondToGate(token, gate.hashPrefix, 'ok');
+        if (!resp.ok) {
+          await interaction.followUp({
+            content: `\u274c \u30b2\u30fc\u30c8\u627f\u8a8d\u5931\u6557: ${resp.reason}`,
+            ephemeral: true,
+          });
+          pendingGates.delete(token);
+          return;
+        }
+
+        // L3 の場合は二重確認が必要 (テキスト "YES" 待ち) — L2 のみここで実行
+        if (gate.tier === 'L3_double_confirm') {
+          // L3 は approve ボタンなし (テキスト入力で "YES")
+          pendingGates.delete(token);
+          return;
+        }
+
+        // L2: 承認成功 → アクション実行
+        console.log(`[gate] L2 approved: ${token.slice(0, 12)}... action=${gate.actionName}`);
+        const resultMsg = await executeGatedAction(gate.actionName, gate.paramsStr);
+        pendingGates.delete(token);
+
+        // ボタンを消してメッセージ更新
+        await interaction.editReply({ components: [] }).catch(() => {});
+        await interaction.followUp({ content: resultMsg }).catch(() => {});
+
+        // harness-gate チャンネルにログ送信
+        try {
+          const gateChannelId = TOPIC_CHANNELS['harness-gate'];
+          if (gateChannelId) {
+            const gateChannel = await (interaction.client as any).channels
+              .fetch(gateChannelId)
+              .catch(() => null);
+            if (gateChannel && 'send' in gateChannel) {
+              await (gateChannel as any)
+                .send(
+                  `\u2705 **Gate L2 \u627f\u8a8d**: \`${gate.actionName}\` by ${interaction.user.tag}\n${resultMsg}`
+                )
+                .catch(() => {});
+            }
+          }
+        } catch {
+          /* ignore logging errors */
+        }
+        return;
+      }
+
+      if (interaction.customId.startsWith('gate_deny_')) {
+        const token = interaction.customId.replace('gate_deny_', '');
+        const gate = pendingGates.get(token);
+        if (!gate) {
+          await interaction.reply({
+            content:
+              '\u26a0\ufe0f \u30b2\u30fc\u30c8\u304c\u671f\u9650\u5207\u308c\u307e\u305f\u306f\u5b58\u5728\u3057\u307e\u305b\u3093',
+            ephemeral: true,
+          });
+          return;
+        }
+        await interaction.deferUpdate().catch(() => {});
+
+        // gate_responder に "no" を送る
+        await respondToGate(token, null, 'no');
+        console.log(`[gate] Denied: ${token.slice(0, 12)}... action=${gate.actionName}`);
+
+        pendingGates.delete(token);
+        if (gate.token2) pendingL3SecondStep.delete(gate.token2);
+
+        // ボタンを消して拒否メッセージ
+        await interaction.editReply({ components: [] }).catch(() => {});
+        await interaction
+          .followUp({
+            content: `\u274c ${gate.actionName}: \u62d2\u5426\u3055\u308c\u307e\u3057\u305f`,
+          })
+          .catch(() => {});
+
+        // harness-gate チャンネルにログ
+        try {
+          const gateChannelId = TOPIC_CHANNELS['harness-gate'];
+          if (gateChannelId) {
+            const gateChannel = await (interaction.client as any).channels
+              .fetch(gateChannelId)
+              .catch(() => null);
+            if (gateChannel && 'send' in gateChannel) {
+              await (gateChannel as any)
+                .send(
+                  `\u274c **Gate \u62d2\u5426**: \`${gate.actionName}\` by ${interaction.user.tag}`
+                )
+                .catch(() => {});
+            }
+          }
+        } catch {
+          /* ignore logging errors */
+        }
+        return;
+      }
+
+      // 承認ボタン (upstream 由来の generic approval)
+      if (interaction.customId.startsWith('xangi_approve_')) {
+        const approvalId = interaction.customId.replace('xangi_approve_', '');
+        resolveApproval(approvalId, true);
+        await interaction.update({ content: '✅ 許可しました', components: [] }).catch(() => {});
+        return;
+      }
+      if (interaction.customId.startsWith('xangi_deny_')) {
+        const approvalId = interaction.customId.replace('xangi_deny_', '');
+        resolveApproval(approvalId, false);
+        await interaction.update({ content: '❌ 拒否しました', components: [] }).catch(() => {});
+        return;
+      }
+
       // 未知のボタン → 何もせずACK
       await interaction.deferUpdate().catch(() => {});
       return;
@@ -412,12 +2163,193 @@ async function main() {
       return;
     }
 
+    if (interaction.commandName === 'backend') {
+      const sub = interaction.options.getSubcommand();
+
+      if (sub === 'show') {
+        const resolved = agentRunner.resolveForChannel(channelId);
+        const override = resolver.getChannelOverride(channelId);
+        const defaultRes = resolver.getDefault();
+        const lines = [
+          `**現在のバックエンド設定** (<#${channelId}>)`,
+          `- バックエンド: **${getBackendDisplayName(resolved.backend)}**`,
+        ];
+        if (resolved.model) lines.push(`- モデル: ${resolved.model}`);
+        if (resolved.effort) lines.push(`- effort: ${resolved.effort}`);
+        if (override) {
+          lines.push(`- ソース: チャンネル設定`);
+        } else {
+          lines.push(`- ソース: デフォルト (.env)`);
+        }
+        lines.push(
+          ``,
+          `**デフォルト:** ${getBackendDisplayName(defaultRes.backend)}${defaultRes.model ? ` (${defaultRes.model})` : ''}`
+        );
+        await interaction.reply(lines.join('\n'));
+        return;
+      }
+
+      if (sub === 'set') {
+        const backendValue = interaction.options.getString(
+          'type',
+          true
+        ) as import('./config.js').AgentBackend;
+        const modelValue = interaction.options.getString('model') ?? undefined;
+        const rawEffort = interaction.options.getString('effort');
+        const effortValue =
+          rawEffort && rawEffort !== 'none'
+            ? (rawEffort as import('./config.js').EffortLevel)
+            : undefined;
+
+        // 許可チェック: ALLOWED_BACKENDSが未設定なら切り替え不可
+        if (!resolver.isBackendAllowed(backendValue)) {
+          const allowedBackends = resolver.getAllowedBackends();
+          if (!config.agent.allowedBackends) {
+            await interaction.reply({
+              content: `❌ バックエンド切り替えが有効になっていません。\n.envに \`ALLOWED_BACKENDS\` を設定してください。`,
+              ephemeral: true,
+            });
+          } else {
+            await interaction.reply({
+              content: `❌ バックエンド \`${backendValue}\` は許可されていません\n許可: ${allowedBackends.map((b) => getBackendDisplayName(b)).join(', ')}`,
+              ephemeral: true,
+            });
+          }
+          return;
+        }
+        if (modelValue && !resolver.isModelAllowed(modelValue)) {
+          await interaction.reply({
+            content: `❌ モデル \`${modelValue}\` は許可されていません`,
+            ephemeral: true,
+          });
+          return;
+        }
+
+        // Local LLMの場合、Ollamaにモデルが存在するか確認
+        if (backendValue === 'local-llm' && modelValue) {
+          try {
+            const ollamaBase = process.env.LOCAL_LLM_BASE_URL || 'http://localhost:11434';
+            const res = await fetch(`${ollamaBase}/api/tags`, {
+              signal: AbortSignal.timeout(3000),
+            });
+            if (res.ok) {
+              const data = (await res.json()) as {
+                models?: Array<{ name: string }>;
+              };
+              const modelNames = data.models?.map((m) => m.name) ?? [];
+              // "qwen3.5:9b" と "qwen3.5:9b" の完全一致、または "qwen3.5" のようなプレフィックス一致
+              const found = modelNames.some(
+                (n) => n === modelValue || n.startsWith(modelValue + ':')
+              );
+              if (!found) {
+                await interaction.reply({
+                  content: `❌ モデル \`${modelValue}\` はOllamaにインストールされていません\nインストール済み: ${modelNames.map((n) => `\`${n}\``).join(', ')}`,
+                  ephemeral: true,
+                });
+                return;
+              }
+            }
+          } catch {
+            // Ollama接続失敗は無視（モデル確認をスキップ）
+          }
+        }
+
+        // channelOverrides に保存
+        resolver.setChannelOverride(channelId, {
+          backend: backendValue,
+          model: modelValue,
+          effort: effortValue,
+        });
+
+        // セッション & ランナー破棄
+        agentRunner.switchBackend(channelId);
+
+        // 切り替え結果を明確に表示
+        const display = getBackendDisplayName(backendValue);
+        const resolvedModel =
+          modelValue ||
+          (backendValue === 'local-llm'
+            ? process.env.LOCAL_LLM_MODEL || '(デフォルト)'
+            : backendValue === 'claude-code'
+              ? process.env.AGENT_MODEL || 'Claude (デフォルト)'
+              : '(デフォルト)');
+        const lines = [
+          `🔄 モデルを切り替えました。新しいセッションを開始します。`,
+          `- バックエンド: **${display}**`,
+          `- モデル: **${resolvedModel}**`,
+        ];
+        if (effortValue) lines.push(`- effort: **${effortValue}**`);
+        await interaction.reply(lines.join('\n'));
+        return;
+      }
+
+      if (sub === 'reset') {
+        resolver.deleteChannelOverride(channelId);
+        agentRunner.switchBackend(channelId);
+        const defaultRes = resolver.getDefault();
+        await interaction.reply(
+          `🔄 デフォルト (**${getBackendDisplayName(defaultRes.backend)}**) に戻しました。新しいセッションを開始します。`
+        );
+        return;
+      }
+
+      if (sub === 'list') {
+        await interaction.deferReply();
+        const allowed = resolver.getAllowedBackends();
+        const allowedModels = resolver.getAllowedModels();
+        const defaultRes = resolver.getDefault();
+        const lines = ['**利用可能なバックエンド:**'];
+        for (const b of allowed) {
+          const isDefault = b === defaultRes.backend;
+          lines.push(`- ${getBackendDisplayName(b)}${isDefault ? ' (デフォルト)' : ''}`);
+        }
+        if (allowedModels && allowedModels.length > 0) {
+          lines.push('', '**許可モデル:**');
+          for (const m of allowedModels) {
+            lines.push(`- \`${m}\``);
+          }
+        }
+
+        // Ollamaモデル一覧を取得（Local LLMが許可されている場合）
+        if (allowed.includes('local-llm')) {
+          try {
+            const ollamaBase = process.env.LOCAL_LLM_BASE_URL || 'http://localhost:11434';
+            const res = await fetch(`${ollamaBase}/api/tags`, {
+              signal: AbortSignal.timeout(3000),
+            });
+            if (res.ok) {
+              const data = (await res.json()) as {
+                models?: Array<{ name: string; size: number }>;
+              };
+              if (data.models && data.models.length > 0) {
+                lines.push('', '**Ollamaモデル（インストール済み）:**');
+                for (const m of data.models) {
+                  const sizeGB = (m.size / 1e9).toFixed(1);
+                  lines.push(`- \`${m.name}\` (${sizeGB}GB)`);
+                }
+              }
+            }
+          } catch {
+            // Ollama接続失敗は無視
+          }
+        }
+
+        if (!config.agent.allowedBackends) {
+          lines.push('', '⚠️ `ALLOWED_BACKENDS` が未設定のため、切り替えは無効です。');
+        }
+
+        await interaction.editReply(lines.join('\n'));
+        return;
+      }
+    }
+
     if (interaction.commandName === 'skip') {
       const skipMessage = interaction.options.getString('message', true);
       await interaction.deferReply();
 
       try {
         const sessionId = getSession(channelId);
+        const appSessionId = ensureSession(channelId, { platform: 'discord' });
 
         // ワンショットのClaudeCodeRunnerを使用（skipPermissionsを確実に反映するため）
         const skipRunner = new ClaudeCodeRunner(config.agent.config);
@@ -425,6 +2357,7 @@ async function main() {
           skipPermissions: true,
           sessionId,
           channelId,
+          appSessionId,
         });
 
         setSession(channelId, runResult.sessionId);
@@ -464,12 +2397,6 @@ async function main() {
 
         // SYSTEM_COMMAND処理
         handleSettingsFromResponse(runResult.result);
-
-        // !discord コマンド処理
-        if (interaction.channel) {
-          const fakeMessage = { channel: interaction.channel } as Message;
-          await handleDiscordCommandsInResponse(runResult.result, fakeMessage);
-        }
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         let errorDetail: string;
@@ -484,6 +2411,44 @@ async function main() {
         }
         await interaction.editReply(errorDetail).catch(() => {});
       }
+      return;
+    }
+
+    if (interaction.commandName === 'autoreply') {
+      if (!config.discord.allowAutoreplyCommand) {
+        await interaction.reply({ content: 'このコマンドは無効です', ephemeral: true });
+        return;
+      }
+      const chId = interaction.channelId;
+      const channels = config.discord.autoReplyChannels ?? [];
+      const idx = channels.indexOf(chId);
+      const isCurrentlyOn = idx !== -1;
+
+      if (isCurrentlyOn) {
+        // OFF: メモリから削除
+        channels.splice(idx, 1);
+      } else {
+        // ON: メモリに追加
+        channels.push(chId);
+      }
+      config.discord.autoReplyChannels = channels;
+
+      // .env に永続化
+      try {
+        const envPath = join(process.cwd(), '.env');
+        const envContent = readFileSync(envPath, 'utf-8');
+        const newValue = channels.join(',');
+        const updated = envContent.replace(
+          /^AUTO_REPLY_CHANNELS=.*$/m,
+          `AUTO_REPLY_CHANNELS=${newValue}`
+        );
+        writeFileSync(envPath, updated, 'utf-8');
+      } catch (e) {
+        console.error('[xangi] Failed to persist AUTO_REPLY_CHANNELS to .env:', e);
+      }
+
+      const status = isCurrentlyOn ? '❌ OFF' : '✅ ON';
+      await interaction.reply(`メンションなし応答: ${status} (<#${chId}>)`);
       return;
     }
 
@@ -533,119 +2498,6 @@ async function main() {
   });
 
   // Discordリンクからメッセージ内容を取得する関数
-  async function fetchDiscordLinkContent(text: string): Promise<string> {
-    const linkRegex = /https?:\/\/(?:www\.)?discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/g;
-    const matches = [...text.matchAll(linkRegex)];
-
-    if (matches.length === 0) return text;
-
-    let result = text;
-    for (const match of matches) {
-      const [fullUrl, , channelId, messageId] = match;
-      try {
-        const channel = await client.channels.fetch(channelId);
-        if (channel && 'messages' in channel) {
-          const fetchedMessage = await channel.messages.fetch(messageId);
-          const author = fetchedMessage.author.tag;
-          const content = fetchedMessage.content || '(添付ファイルのみ)';
-          const attachmentInfo =
-            fetchedMessage.attachments.size > 0
-              ? `\n[添付: ${fetchedMessage.attachments.map((a) => a.name).join(', ')}]`
-              : '';
-
-          const quotedContent = `\n---\n📎 引用メッセージ (${author}):\n${content}${attachmentInfo}\n---\n`;
-          result = result.replace(fullUrl, quotedContent);
-          console.log(`[xangi] Fetched linked message from channel ${channelId}`);
-        }
-      } catch (err) {
-        console.error(`[xangi] Failed to fetch linked message: ${fullUrl}`, err);
-        // 取得失敗時はリンクをそのまま残す
-      }
-    }
-
-    return result;
-  }
-
-  // 返信元メッセージを取得してプロンプトに追加する関数
-  async function fetchReplyContent(message: Message): Promise<string | null> {
-    if (!message.reference?.messageId) return null;
-
-    try {
-      const channel = message.channel;
-      if (!('messages' in channel)) return null;
-
-      const repliedMessage = await channel.messages.fetch(message.reference.messageId);
-      const author = repliedMessage.author.tag;
-      const content = repliedMessage.content || '(添付ファイルのみ)';
-      const attachmentInfo =
-        repliedMessage.attachments.size > 0
-          ? `\n[添付: ${repliedMessage.attachments.map((a) => a.name).join(', ')}]`
-          : '';
-
-      console.log(`[xangi] Fetched reply-to message from ${author}`);
-      return `\n---\n💬 返信元 (${author}):\n${content}${attachmentInfo}\n---\n`;
-    } catch (err) {
-      console.error(`[xangi] Failed to fetch reply-to message:`, err);
-      return null;
-    }
-  }
-
-  /**
-   * メッセージコンテンツ内のチャンネルメンション <#ID> を無害化する
-   * fetchChannelMessages() による意図しない二重展開を防ぐ
-   */
-  function sanitizeChannelMentions(content: string): string {
-    return content.replace(/<#(\d+)>/g, '#$1');
-  }
-
-  // チャンネルメンションから最新メッセージを取得する関数
-  async function fetchChannelMessages(text: string): Promise<string> {
-    const channelMentionRegex = /<#(\d+)>/g;
-    const matches = [...text.matchAll(channelMentionRegex)];
-
-    if (matches.length === 0) return text;
-
-    let result = text;
-    for (const match of matches) {
-      const [fullMention, channelId] = match;
-      try {
-        const channel = await client.channels.fetch(channelId);
-        if (channel && 'messages' in channel) {
-          const messages = await channel.messages.fetch({ limit: 10 });
-          const channelName = 'name' in channel ? channel.name : 'unknown';
-
-          const messageList = messages
-            .reverse()
-            .map((m) => {
-              const time = m.createdAt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
-              const content = sanitizeChannelMentions(m.content || '(添付ファイルのみ)');
-              return `[${time}] ${m.author.tag}: ${content}`;
-            })
-            .join('\n');
-
-          const expandedContent = `\n---\n📺 #${channelName} の最新メッセージ:\n${messageList}\n---\n`;
-          result = result.replace(fullMention, expandedContent);
-          console.log(`[xangi] Fetched messages from channel #${channelName}`);
-        }
-      } catch (err) {
-        console.error(`[xangi] Failed to fetch channel messages: ${channelId}`, err);
-      }
-    }
-
-    return result;
-  }
-
-  /**
-   * チャンネルメンション <#ID> にチャンネルID注釈を追加
-   * 例: <#123456> → <#123456> [チャンネルID: 123456]
-   */
-  function annotateChannelMentions(text: string): string {
-    return text.replace(/<#(\d+)>/g, (match, id) => `${match} [チャンネルID: ${id}]`);
-  }
-
-  /**
-   * Discord の 2000 文字制限に合わせてメッセージを分割する
-   */
   function chunkDiscordMessage(message: string, limit = DISCORD_MAX_LENGTH): string[] {
     if (message.length <= limit) return [message];
 
@@ -1015,215 +2867,226 @@ async function main() {
 
     return { handled: false };
   }
+  async function fetchDiscordLinkContent(text: string): Promise<string> {
+    const linkRegex = /https?:\/\/(?:www\.)?discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/g;
+    const matches = [...text.matchAll(linkRegex)];
 
-  /**
-   * AIの応答から !discord コマンドを検知して実行
-   * コードブロック内のコマンドは無視する
-   * !discord send は複数行メッセージに対応（次の !discord / !schedule コマンド行まで吸収）
-   * feedback: true のコマンド結果はDiscordに送信せずフィードバック配列に収集して返す
-   */
-  async function handleDiscordCommandsInResponse(
-    text: string,
-    sourceMessage?: Message,
-    fallbackChannelId?: string
-  ): Promise<string[]> {
-    const lines = text.split('\n');
-    let inCodeBlock = false;
-    let i = 0;
-    const feedbackResults: string[] = [];
+    if (matches.length === 0) return text;
 
-    while (i < lines.length) {
-      const line = lines[i];
+    let result = text;
+    for (const match of matches) {
+      const [fullUrl, , channelId, messageId] = match;
+      try {
+        const channel = await client.channels.fetch(channelId);
+        if (channel && 'messages' in channel) {
+          const fetchedMessage = await channel.messages.fetch(messageId);
+          const author = fetchedMessage.author.tag;
+          const content = fetchedMessage.content || '(添付ファイルのみ)';
+          const attachmentInfo =
+            fetchedMessage.attachments.size > 0
+              ? `\n[添付: ${fetchedMessage.attachments.map((a) => a.name).join(', ')}]`
+              : '';
 
-      // コードブロックの開始/終了を追跡
-      if (line.trim().startsWith('```')) {
-        inCodeBlock = !inCodeBlock;
-        i++;
-        continue;
-      }
-
-      // コードブロック内はスキップ
-      if (inCodeBlock) {
-        i++;
-        continue;
-      }
-
-      const trimmed = line.trim();
-
-      // !discord send の複数行対応
-      const sendMatch = trimmed.match(/^!discord\s+send\s+<#(\d+)>\s*(.*)/);
-      if (sendMatch) {
-        const firstLineContent = sendMatch[2] ?? '';
-
-        if (firstLineContent.trim() === '') {
-          // 本文が空 → 次の !discord / !schedule コマンド行まで吸収（暗黙マルチライン）
-          const bodyLines: string[] = [];
-          let inBodyCodeBlock = false;
-          i++;
-          while (i < lines.length) {
-            const bodyLine = lines[i];
-            if (bodyLine.trim().startsWith('```')) {
-              inBodyCodeBlock = !inBodyCodeBlock;
-            }
-            // コードブロック外で次のコマンド行が来たら吸収終了
-            if (
-              !inBodyCodeBlock &&
-              (bodyLine.trim().startsWith('!discord ') || bodyLine.trim().startsWith('!schedule'))
-            ) {
-              break;
-            }
-            bodyLines.push(bodyLine);
-            i++;
-          }
-          const fullMessage = bodyLines.join('\n').trim();
-          if (fullMessage) {
-            const commandText = `!discord send <#${sendMatch[1]}> ${fullMessage}`;
-            console.log(
-              `[xangi] Processing discord command from response: ${commandText.slice(0, 50)}...`
-            );
-            const result = await handleDiscordCommand(
-              commandText,
-              sourceMessage,
-              fallbackChannelId
-            );
-            if (result.handled && result.response) {
-              if (result.feedback) {
-                feedbackResults.push(result.response);
-              } else if (sourceMessage) {
-                const channel = sourceMessage.channel;
-                if (
-                  'send' in channel &&
-                  typeof (channel as { send?: unknown }).send === 'function'
-                ) {
-                  await (channel as { send: (content: string) => Promise<unknown> }).send(
-                    result.response
-                  );
-                }
-              }
-            }
-          }
-          continue; // i は既に次のコマンド行を指している
-        } else {
-          // 1行目にテキストあり → 続く行も吸収（次のコマンド行まで）
-          const bodyLines: string[] = [firstLineContent];
-          let inBodyCodeBlock2 = false;
-          i++;
-          while (i < lines.length) {
-            const bodyLine = lines[i];
-            if (bodyLine.trim().startsWith('```')) {
-              inBodyCodeBlock2 = !inBodyCodeBlock2;
-            }
-            if (
-              !inBodyCodeBlock2 &&
-              (bodyLine.trim().startsWith('!discord ') || bodyLine.trim().startsWith('!schedule'))
-            ) {
-              break;
-            }
-            bodyLines.push(bodyLine);
-            i++;
-          }
-          const fullMessage = bodyLines.join('\n').trimEnd();
-          const commandText = `!discord send <#${sendMatch[1]}> ${fullMessage}`;
-          console.log(
-            `[xangi] Processing discord command from response: ${commandText.slice(0, 50)}...`
-          );
-          const result = await handleDiscordCommand(commandText, sourceMessage, fallbackChannelId);
-          if (result.handled && result.response) {
-            if (result.feedback) {
-              feedbackResults.push(result.response);
-            } else if (sourceMessage) {
-              const channel = sourceMessage.channel;
-              if ('send' in channel && typeof (channel as { send?: unknown }).send === 'function') {
-                await (channel as { send: (content: string) => Promise<unknown> }).send(
-                  result.response
-                );
-              }
-            }
-          }
-          continue;
+          const quotedContent = `\n---\n📎 引用メッセージ (${author}):\n${content}${attachmentInfo}\n---\n`;
+          result = result.replace(fullUrl, quotedContent);
+          console.log(`[xangi] Fetched linked message from channel ${channelId}`);
         }
+      } catch (err) {
+        console.error(`[xangi] Failed to fetch linked message: ${fullUrl}`, err);
+        // 取得失敗時はリンクをそのまま残す
       }
-
-      // !discord edit の複数行対応
-      const editMatch = trimmed.match(/^!discord\s+edit\s+(\S+)\s*([\s\S]*)/);
-      if (editMatch) {
-        const editTarget = editMatch[1];
-        const firstLineContent = editMatch[2] ?? '';
-        const bodyLines: string[] = firstLineContent ? [firstLineContent] : [];
-        let inEditCodeBlock = false;
-        i++;
-        while (i < lines.length) {
-          const bodyLine = lines[i];
-          if (bodyLine.trim().startsWith('```')) {
-            inEditCodeBlock = !inEditCodeBlock;
-          }
-          if (
-            !inEditCodeBlock &&
-            (bodyLine.trim().startsWith('!discord ') || bodyLine.trim().startsWith('!schedule'))
-          ) {
-            break;
-          }
-          bodyLines.push(bodyLine);
-          i++;
-        }
-        const fullContent = bodyLines.join('\n').trim();
-        if (fullContent) {
-          const commandText = `!discord edit ${editTarget} ${fullContent}`;
-          console.log(
-            `[xangi] Processing discord edit from response: ${commandText.slice(0, 50)}...`
-          );
-          const result = await handleDiscordCommand(commandText, sourceMessage, fallbackChannelId);
-          if (result.handled && result.response) {
-            if (result.feedback) {
-              feedbackResults.push(result.response);
-            } else if (sourceMessage) {
-              const channel = sourceMessage.channel;
-              if ('send' in channel && typeof (channel as { send?: unknown }).send === 'function') {
-                await (channel as { send: (content: string) => Promise<unknown> }).send(
-                  result.response
-                );
-              }
-            }
-          }
-        }
-        continue;
-      }
-
-      // その他の !discord コマンド（channels, search, history, delete）
-      if (trimmed.startsWith('!discord ')) {
-        console.log(`[xangi] Processing discord command from response: ${trimmed.slice(0, 50)}...`);
-        const result = await handleDiscordCommand(trimmed, sourceMessage, fallbackChannelId);
-        if (result.handled && result.response) {
-          if (result.feedback) {
-            feedbackResults.push(result.response);
-          } else if (sourceMessage) {
-            const channel = sourceMessage.channel;
-            if ('send' in channel && typeof (channel as { send?: unknown }).send === 'function') {
-              await (channel as { send: (content: string) => Promise<unknown> }).send(
-                result.response
-              );
-            }
-          }
-        }
-      }
-
-      // !schedule コマンド（引数なしでもlist表示、sourceMessage必須）
-      if (sourceMessage && (trimmed === '!schedule' || trimmed.startsWith('!schedule '))) {
-        console.log(
-          `[xangi] Processing schedule command from response: ${trimmed.slice(0, 50)}...`
-        );
-        await executeScheduleFromResponse(trimmed, sourceMessage, scheduler, config.scheduler);
-      }
-
-      i++;
     }
 
-    return feedbackResults;
+    return result;
+  }
+
+  // 返信元メッセージを取得してプロンプトに追加する関数
+  async function fetchReplyContent(message: Message): Promise<string | null> {
+    if (!message.reference?.messageId) return null;
+
+    try {
+      const channel = message.channel;
+      if (!('messages' in channel)) return null;
+
+      const repliedMessage = await channel.messages.fetch(message.reference.messageId);
+      const author = repliedMessage.author.tag;
+      const content = repliedMessage.content || '(添付ファイルのみ)';
+      const attachmentInfo =
+        repliedMessage.attachments.size > 0
+          ? `\n[添付: ${repliedMessage.attachments.map((a) => a.name).join(', ')}]`
+          : '';
+
+      console.log(`[xangi] Fetched reply-to message from ${author}`);
+      return `\n---\n💬 返信元 (${author}):\n${content}${attachmentInfo}\n---\n`;
+    } catch (err) {
+      console.error(`[xangi] Failed to fetch reply-to message:`, err);
+      return null;
+    }
+  }
+
+  /**
+   * メッセージコンテンツ内のチャンネルメンション <#ID> を無害化する
+   * fetchChannelMessages() による意図しない二重展開を防ぐ
+   */
+  function sanitizeChannelMentions(content: string): string {
+    return content.replace(/<#(\d+)>/g, '#$1');
+  }
+
+  // チャンネルメンションから最新メッセージを取得する関数
+  async function fetchChannelMessages(text: string): Promise<string> {
+    const channelMentionRegex = /<#(\d+)>/g;
+    const matches = [...text.matchAll(channelMentionRegex)];
+
+    if (matches.length === 0) return text;
+
+    let result = text;
+    for (const match of matches) {
+      const [fullMention, channelId] = match;
+      try {
+        const channel = await client.channels.fetch(channelId);
+        if (channel && 'messages' in channel) {
+          const messages = await channel.messages.fetch({ limit: 10 });
+          const channelName = 'name' in channel ? channel.name : 'unknown';
+
+          const messageList = messages
+            .reverse()
+            .map((m) => {
+              const time = m.createdAt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+              const content = sanitizeChannelMentions(m.content || '(添付ファイルのみ)');
+              return `[${time}] ${m.author.tag}: ${content}`;
+            })
+            .join('\n');
+
+          const expandedContent = `\n---\n📺 #${channelName} の最新メッセージ:\n${messageList}\n---\n`;
+          result = result.replace(fullMention, expandedContent);
+          console.log(`[xangi] Fetched messages from channel #${channelName}`);
+        }
+      } catch (err) {
+        console.error(`[xangi] Failed to fetch channel messages: ${channelId}`, err);
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * チャンネルメンション <#ID> にチャンネルID注釈を追加
+   * 例: <#123456> → <#123456> [チャンネルID: 123456]
+   */
+  function annotateChannelMentions(text: string): string {
+    return text.replace(/<#(\d+)>/g, (match, id) => `${match} [チャンネルID: ${id}]`);
   }
 
   // Discord APIエラーでプロセスが落ちないようにハンドリング
   client.on('error', (error) => {
     console.error('[xangi] Discord client error:', error.message);
+  });
+
+  // === Voice → SNS publish pipeline (reaction-based) ===
+  // 自分の音声メッセージに 🎙️ を付けると note + stand.fm の両方に音声投稿
+  const PUBLISH_EMOJI_TO_TARGET: Record<string, string> = {
+    '🎙️': 'both',
+    '🎙': 'both',
+  };
+  const PUBLISH_AUDIO_EXTS = ['.ogg', '.opus', '.wav', '.mp3', '.m4a', '.flac', '.webm'];
+  client.on(Events.MessageReactionAdd, async (reaction, user) => {
+    if (user.bot) return;
+    const allowed = config.discord.allowedUsers || [];
+    if (!allowed.includes('*') && !allowed.includes(user.id)) return;
+
+    try {
+      if (reaction.partial) await reaction.fetch();
+      if (reaction.message.partial) await reaction.message.fetch();
+    } catch (err) {
+      console.error('[xangi] reaction fetch failed:', err);
+      return;
+    }
+
+    const emojiName = reaction.emoji.name || '';
+    if (emojiName === HANDOFF_EMOJI) {
+      const message = reaction.message;
+      const ref = message.reference;
+      if (!ref?.messageId) return;
+
+      try {
+        const refChannelId = ref.channelId || message.channel.id;
+        const refChannel = await message.client.channels.fetch(refChannelId).catch(() => null);
+        if (!refChannel || !('messages' in refChannel)) return;
+
+        const original = await (refChannel as any).messages.fetch(ref.messageId).catch(() => null);
+        if (!original) return;
+
+        const topicResult = classifyTopic(
+          String(original.content || ''),
+          String(message.content || '')
+        );
+        if (!topicResult.channelId || topicResult.topic === 'general') {
+          await message
+            .reply('⚠️ 専用チャンネルへの移動先を特定できませんでした。')
+            .catch(() => {});
+          return;
+        }
+        if (message.channel.id !== GENERAL_TEXT_CHANNEL_ID) {
+          await message.reply(`🧭 この移動は #一般 から使う想定です。`).catch(() => {});
+          return;
+        }
+
+        const targetChannel = await message.client.channels
+          .fetch(topicResult.channelId)
+          .catch(() => null);
+        if (!targetChannel || !('send' in targetChannel)) return;
+
+        const movedText = [
+          `**[handoff:${topicResult.topic}]** <#${message.channel.id}> から移動`,
+          `> ${String(original.content || '').slice(0, 220)}`,
+          '',
+          String(message.content || '').slice(0, 1200),
+        ].join('\n');
+        await (targetChannel as any)
+          .send(movedText)
+          .catch((e: any) => console.error('[xangi] handoff route error:', e));
+        await message.reply(`🧭 <#${topicResult.channelId}> に移しました。`).catch(() => {});
+      } catch (err) {
+        console.error('[xangi] handoff reaction error:', err);
+        await message.reply('⚠️ 移動処理に失敗しました。').catch(() => {});
+      }
+      return;
+    }
+    const target = PUBLISH_EMOJI_TO_TARGET[emojiName];
+    if (!target) return;
+
+    const message = reaction.message;
+    // 本人の音声のみ対象 (他人の投稿の勝手な公開を防ぐ)
+    if (message.author?.id !== user.id) return;
+
+    const audioAttachment = message.attachments.find((a) => {
+      const nm = (a.name || a.url || '').toLowerCase();
+      return PUBLISH_AUDIO_EXTS.some((ext) => nm.includes(ext));
+    });
+    if (!audioAttachment) return;
+
+    try {
+      await message.reply(`⏳ ${target} 向けにステージング中...`);
+      const params = JSON.stringify({
+        audio_url: audioAttachment.url,
+        target,
+        discord_message_id: message.id,
+        discord_channel_id: message.channel.id,
+      });
+      const raw = await execPython(
+        ['action_executor.py', '--action', 'publish_voice', '--params', params],
+        600000
+      );
+      const parsed = JSON.parse(raw);
+      const formatted = formatActionResult('publish_voice', parsed);
+      const chunks = splitMessage(formatted, 2000);
+      for (const chunk of chunks) {
+        await message.reply(chunk);
+      }
+    } catch (err) {
+      console.error('[xangi] publish_voice error:', err);
+      await message.reply('⚠️ publish_voice 失敗: ' + String(err).slice(0, 200));
+    }
   });
 
   // チャンネル単位の処理中ロック
@@ -1233,15 +3096,50 @@ async function main() {
   client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
 
+    // === Izuna Memory: log ALL non-bot messages into session.db (discord_msg) ===
+    // 返信有無に関わらず Suguru の発言を全チャンネルで蓄積する。
+    try {
+      const raw = message.content || '';
+      if (raw.trim().length >= 5) {
+        const channelName =
+          (message.channel as any).name || (!message.guild ? 'DM' : message.channel.id);
+        const logContent = `[${message.author.username}@${channelName}] ${raw.slice(0, 1500)}`;
+        execFile(
+          'python3',
+          [
+            pathJoin(ACTION_SCRIPTS_DIR, 'memory_curator.py'),
+            'record',
+            '--agent',
+            'discord',
+            '--type',
+            'discord_msg',
+            '--content',
+            logContent,
+            '--source-type',
+            'discord',
+            '--session-id',
+            message.channel.id,
+          ],
+          { timeout: 5000, cwd: ACTION_SCRIPTS_DIR },
+          () => {}
+        );
+      }
+    } catch {
+      /* noop */
+    }
+
     const isMentioned = message.mentions.has(client.user!);
     const isDM = !message.guild;
+    const isAutoReplyAll = config.discord.autoReplyAll === true;
     const isAutoReplyChannel =
-      config.discord.autoReplyChannels?.includes(message.channel.id) ?? false;
+      isAutoReplyAll || (config.discord.autoReplyChannels?.includes(message.channel.id) ?? false);
 
-    if (!isMentioned && !isDM && !isAutoReplyChannel) return;
+    const isDevIzunaChannel = message.channel.id === DEV_IZUNA_CHANNEL_ID;
+
+    if (!isMentioned && !isDM && !isAutoReplyChannel && !isDevIzunaChannel) return;
 
     // 同じチャンネルで処理中なら無視（メンション時は除く）
-    if (!isMentioned && processingChannels.has(message.channel.id)) {
+    if (!isMentioned && !isDevIzunaChannel && processingChannels.has(message.channel.id)) {
       console.log(`[xangi] Skipping message in busy channel: ${message.channel.id}`);
       return;
     }
@@ -1254,10 +3152,108 @@ async function main() {
       return;
     }
 
+    // dev-izuna: 自動開発フロー (mention/autoReply 条件を無視して必ず処理)
+    if (isDevIzunaChannel) {
+      try {
+        await handleDevIzunaMessage(message);
+      } catch (e) {
+        console.error('[dev-izuna] handler error:', e);
+      }
+      return;
+    }
+
     let prompt = message.content
       .replace(/<@[!&]?\d+>/g, '') // ユーザーメンションのみ削除（チャンネルメンションは残す）
       .replace(/\s+/g, ' ')
       .trim();
+
+    // === Gate L3 "YES" text handler (Phase 4b) ===
+    if (prompt.trim().toUpperCase() === 'YES') {
+      // L3 二重確認: channelId に紐づく pending L3 gate を検索
+      let matchedToken: string | null = null;
+      let matchedGate: PendingGate | null = null;
+      for (const [token, gate] of pendingGates) {
+        if (
+          gate.channelId === message.channel.id &&
+          gate.tier === 'L3_double_confirm' &&
+          gate.token2
+        ) {
+          matchedToken = token;
+          matchedGate = gate;
+          break;
+        }
+      }
+      if (matchedToken && matchedGate) {
+        // Step 1: first token に "ok" を送る
+        const resp1 = await respondToGate(matchedToken, matchedGate.hashPrefix, 'ok');
+        if (!resp1.ok) {
+          if ('send' in message.channel) {
+            await (message.channel as any).send(
+              `\u274c L3 \u30b2\u30fc\u30c8\u627f\u8a8d\u5931\u6557 (step 1): ${resp1.reason}`
+            );
+          }
+          pendingGates.delete(matchedToken);
+          if (matchedGate.token2) pendingL3SecondStep.delete(matchedGate.token2);
+          return;
+        }
+        // Step 2: token2 に "yes" を送る
+        const resp2 = await respondToGate(matchedGate.token2!, null, 'yes');
+        if (!resp2.ok) {
+          if ('send' in message.channel) {
+            await (message.channel as any).send(
+              `\u274c L3 \u30b2\u30fc\u30c8\u627f\u8a8d\u5931\u6557 (step 2): ${resp2.reason}`
+            );
+          }
+          pendingGates.delete(matchedToken);
+          pendingL3SecondStep.delete(matchedGate.token2!);
+          return;
+        }
+        // Step 3: アクション実行
+        console.log(
+          `[gate] L3 double-confirmed: ${matchedToken.slice(0, 12)}... action=${matchedGate.actionName}`
+        );
+        const resultMsg = await executeGatedAction(matchedGate.actionName, matchedGate.paramsStr);
+        pendingGates.delete(matchedToken);
+        pendingL3SecondStep.delete(matchedGate.token2!);
+
+        if ('send' in message.channel) {
+          await (message.channel as any).send(resultMsg);
+        }
+        // ゲートメッセージのボタンを消す
+        try {
+          if (matchedGate.messageId) {
+            const gateMsg = await message.channel.messages
+              .fetch(matchedGate.messageId)
+              .catch(() => null);
+            if (gateMsg && gateMsg.editable) {
+              await gateMsg.edit({ components: [] }).catch(() => {});
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+
+        // harness-gate チャンネルにログ
+        try {
+          const gateChannelId = TOPIC_CHANNELS['harness-gate'];
+          if (gateChannelId) {
+            const gateChannel = await (message.client as any).channels
+              .fetch(gateChannelId)
+              .catch(() => null);
+            if (gateChannel && 'send' in gateChannel) {
+              await (gateChannel as any)
+                .send(
+                  `\u2705 **Gate L3 \u4e8c\u91cd\u627f\u8a8d**: \`${matchedGate.actionName}\` by ${message.author.tag}\n${resultMsg}`
+                )
+                .catch(() => {});
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+    }
 
     // スキップ設定（返信元追加やリンク展開の前に判定する）
     // !skip プレフィックスで一時的にスキップモードにできる
@@ -1279,7 +3275,13 @@ async function main() {
           // processPromptに流す（下に続く）
         } else {
           if (result.response && 'send' in message.channel) {
-            await message.channel.send(result.response);
+            const gateChunks = splitMessage(result.response, DISCORD_SAFE_LENGTH);
+            const gateChannel = message.channel as unknown as {
+              send: (content: string) => Promise<unknown>;
+            };
+            for (const chunk of gateChunks) {
+              await gateChannel.send(chunk);
+            }
           }
           return;
         }
@@ -1292,6 +3294,145 @@ async function main() {
       return;
     }
 
+    // !skill コマンド群 — Discord からエージェント設定を直接触る窓口 (LLM 経由しない)
+    //   !skill                        → このチャンネルの現状表示
+    //   !skill agent=<name>           → このチャンネル担当 agent 再割当 (json 永続化)
+    //   !skill agent=none             → 既定 agent 解除 (multi-agent dispatcher に戻す)
+    //   !skill <type>: <新prompt本文> → script-writer の system_prompt 書き換え
+    const trimmedPrompt = prompt.trim();
+    if (trimmedPrompt === '!skill' || trimmedPrompt.toLowerCase().startsWith('!skill ')) {
+      const chMap = loadChannelAgentMap();
+      const current = chMap[message.channelId];
+
+      // mode 1: 引数なし → 現状表示 (trim() 済みなので空白末尾ケースは不要)
+      if (trimmedPrompt === '!skill') {
+        const lines = [
+          '**🔧 !skill ヘルプ**',
+          '',
+          current
+            ? `現在このチャンネルの担当: **${current.agent}** (track=${current.track})`
+            : `このチャンネルに固定 agent は設定されていません (multi-agent dispatcher)`,
+          '',
+          '**使い方:**',
+          '`!skill` — この表示',
+          '`!skill agent=<name>` — 担当 agent 変更 (例 `!skill agent=mail-agent`)',
+          '`!skill agent=none` — 担当解除 (multi-agent に戻す)',
+          '`!skill scene:` (または character/outline/brainstorm/roleplay) + 改行 + 新プロンプト本文',
+          '  → script-writer の該当 type の system_prompt を書き換え',
+          '  ※ type 名は `scene` など **そのまま** (`<>` や `<script-writer-agent>` ではない)',
+          '',
+          '**例:**',
+          '```',
+          '!skill scene:',
+          'あなたは漫画台本の執筆者。セリフ90%構成、情景と感情もセリフで説明…',
+          '```',
+          '',
+          '**利用可能な agent:**',
+          '`' + VALID_AGENTS.join('`, `') + '`',
+        ];
+        await message.reply(lines.join('\n'));
+        return;
+      }
+
+      // mode 2: agent= 指定 → 担当再割当
+      const agentMatch = trimmedPrompt.match(/^!skill\s+agent\s*=\s*([\w-]+)\s*$/i);
+      if (agentMatch) {
+        const newAgent = agentMatch[1];
+        if (newAgent.toLowerCase() === 'none') {
+          try {
+            saveChannelAgentMapEntry(message.channelId, null);
+            await message.reply(
+              `✅ このチャンネルの固定 agent を解除しました (multi-agent dispatcher に戻ります)`
+            );
+          } catch (err) {
+            await message.reply('⚠️ 保存失敗: ' + String(err).slice(0, 200));
+          }
+          return;
+        }
+        if (!(VALID_AGENTS as readonly string[]).includes(newAgent)) {
+          await message.reply(
+            `⚠️ 未定義の agent: \`${newAgent}\`\n利用可能: ` +
+              VALID_AGENTS.map((a) => '`' + a + '`').join(', ')
+          );
+          return;
+        }
+        // dev agents のリスト (dispatch.py::DEV_AGENTS と同期)
+        const devAgents = new Set([
+          'dmat-keychain-agent',
+          'koereq-agent',
+          'nurseai-agent',
+          'hayabusa-agent',
+        ]);
+        const track = devAgents.has(newAgent) ? 'dev' : 'worker';
+        const channelName = (message.channel as { name?: string }).name || message.channelId;
+        try {
+          saveChannelAgentMapEntry(message.channelId, {
+            track,
+            agent: newAgent,
+            name: `#${channelName}`,
+          });
+          await message.reply(
+            `✅ このチャンネル (\`#${channelName}\`) の担当 agent を **${newAgent}** (${track}) に設定しました。` +
+              `\n次のメッセージから反映されます。`
+          );
+        } catch (err) {
+          await message.reply('⚠️ 保存失敗: ' + String(err).slice(0, 200));
+        }
+        return;
+      }
+
+      // mode 3: !skill <type>: <prompt> — script-writer の prompt 書換
+      // `<type>` や `<script-writer-agent>` の誤入力 (placeholder のまま) は親切に誘導
+      const placeholder = trimmedPrompt.match(/^!skill\s+<[^>]+>/i);
+      if (placeholder) {
+        await message.reply(
+          '⚠️ `<type>` や `<script-writer-agent>` はプレースホルダです。`<>` を外して type 名 (`scene` / `character` / `outline` / `brainstorm` / `roleplay`) を直接書いてください。\n例: `!skill scene:`+改行+新プロンプト'
+        );
+        return;
+      }
+      const m = trimmedPrompt.match(
+        /^!skill\s+(scene|character|outline|brainstorm|roleplay)\s*[:：]?\s*\n?([\s\S]*)$/i
+      );
+      if (!m) {
+        await message.reply(
+          '⚠️ 書式不明。`!skill` だけ送ると使い方表示されます。type 名は `scene` / `character` / `outline` / `brainstorm` / `roleplay` のどれかを、`<>` なしでそのまま書いてください。'
+        );
+        return;
+      }
+      const skillType = m[1].toLowerCase();
+      const newPrompt = (m[2] || '').trim();
+      if (!newPrompt) {
+        await message.reply(`⚠️ \`!skill ${skillType}:\` の後に新しいプロンプトを書いてください`);
+        return;
+      }
+      try {
+        const params = JSON.stringify({
+          skill: 'script-writer',
+          type: skillType,
+          system_prompt: newPrompt,
+        });
+        const raw = await execPython(
+          ['action_executor.py', '--action', 'skill_edit', '--params', params],
+          30000
+        );
+        const parsed = JSON.parse(raw);
+        if (parsed.ok) {
+          await message.reply(
+            `✅ script-writer / **${skillType}** の system_prompt を更新しました ` +
+              `(${newPrompt.length} chars)\n次の台本生成から反映されます`
+          );
+        } else {
+          await message.reply(
+            `⚠️ 更新失敗: ${parsed.error || 'unknown'}\nhint: ${parsed.hint || '-'}`
+          );
+        }
+      } catch (err) {
+        console.error('[xangi] !skill error:', err);
+        await message.reply('⚠️ !skill コマンドエラー: ' + String(err).slice(0, 300));
+      }
+      return;
+    }
+
     // Discordリンクからメッセージ内容を取得
     prompt = await fetchDiscordLinkContent(prompt);
 
@@ -1301,11 +3442,105 @@ async function main() {
       prompt = replyContent + prompt;
     }
 
+    // === Video Elaborate: bot の動画解析メッセージへの引用返信は video_elaborate に回す ===
+    // 検出条件: 引用元が本 bot の送信 & 本文に【映像】 or 【音声】 or 動画解析 が含まれる
+    // (= 直近の video_from_url リプライ)。cache TTL 内なら Hayabusa に追加質問を投げる。
+    if (message.attachments.size === 0 && message.reference?.messageId) {
+      try {
+        const channel = message.channel;
+        if ('messages' in channel) {
+          const replied = await channel.messages.fetch(message.reference.messageId);
+          const isBot = client.user && replied.author.id === client.user.id;
+          const rc = replied.content || '';
+          const looksVideoResult =
+            rc.includes('動画解析') || rc.includes('【映像】') || rc.includes('【音声】');
+          if (isBot && looksVideoResult) {
+            const question = (message.content || '').trim();
+            if (question.length > 0) {
+              const progressMsg = await message.reply('⏳ 追加解説を生成中...');
+              try {
+                const params = JSON.stringify({
+                  channel_id: message.channelId,
+                  question,
+                });
+                const raw = await execPython(
+                  ['action_executor.py', '--action', 'video_elaborate', '--params', params],
+                  300000 // 5分
+                );
+                const parsed = JSON.parse(raw);
+                const formatted = formatActionResult('video_elaborate', parsed);
+                const chunks = splitMessage(formatted, 2000);
+                if (chunks.length === 0) {
+                  await progressMsg.edit('⚠️ 追加解説を生成できませんでした');
+                } else {
+                  await progressMsg.edit(chunks[0]);
+                  for (let i = 1; i < chunks.length; i++) {
+                    await message.reply(chunks[i]);
+                  }
+                }
+              } catch (err) {
+                console.error('[xangi] video_elaborate error:', err);
+                await progressMsg.edit('⚠️ 追加解説に失敗: ' + String(err).slice(0, 200));
+              }
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[xangi] video_elaborate route check failed:', err);
+      }
+    }
+
     // チャンネルメンションにID注釈を追加（展開前に実行）
     prompt = annotateChannelMentions(prompt);
 
     // チャンネルメンションから最新メッセージを取得
     prompt = await fetchChannelMessages(prompt);
+
+    // === Video URL Pipeline (iOS Shortcut / DM貼り付け) ===
+    // X/Twitter の status URL を先頭に含むメッセージは discord_video_bridge に投げる。
+    // URL以降の付随コメントが短い (<=30字) ものに限り、通常の雑談と干渉しないように。
+    if (message.attachments.size === 0) {
+      const TWEET_URL_RE_TS =
+        /^https?:\/\/(?:mobile\.)?(?:twitter\.com|x\.com)\/[\w._-]+\/status\/\d+/i;
+      const trimmedBody = (message.content || '').trim();
+      const m = trimmedBody.match(TWEET_URL_RE_TS);
+      if (m) {
+        const url = m[0];
+        const rest = trimmedBody.slice(url.length).trim();
+        if (rest.length <= 30) {
+          // 1メッセージ完結型フロー: ⏳ メッセージを送って、結果届いたら edit() で置き換え。
+          // 結果が 2000 字超過なら最初の chunk だけ edit、残りを追加 reply。
+          const progressMsg = await message.reply('⏳ X動画を取得中...');
+          try {
+            const params = JSON.stringify({
+              url,
+              archive: true,
+              channel_id: message.channelId,
+            });
+            const raw = await execPython(
+              ['action_executor.py', '--action', 'video_from_url', '--params', params],
+              600000 // 10分 (DL + 解析)
+            );
+            const parsed = JSON.parse(raw);
+            const formatted = formatActionResult('video_from_url', parsed);
+            const chunks = splitMessage(formatted, 2000);
+            if (chunks.length === 0) {
+              await progressMsg.edit('⚠️ 解析結果が空でした');
+            } else {
+              await progressMsg.edit(chunks[0]);
+              for (let i = 1; i < chunks.length; i++) {
+                await message.reply(chunks[i]);
+              }
+            }
+          } catch (err) {
+            console.error('[xangi] video_from_url error:', err);
+            await progressMsg.edit('⚠️ X動画解析に失敗: ' + String(err).slice(0, 200));
+          }
+          return;
+        }
+      }
+    }
 
     // 添付ファイルをダウンロード
     const attachmentPaths: string[] = [];
@@ -1322,6 +3557,102 @@ async function main() {
 
     // テキストも添付もない場合はスキップ
     if (!prompt && attachmentPaths.length === 0) return;
+
+    // === Voice Pipeline: 音声メッセージ自動書き起こし ===
+    const AUDIO_EXTS = ['.ogg', '.opus', '.wav', '.mp3', '.m4a', '.flac', '.webm'];
+    const audioFiles = attachmentPaths.filter((fp) =>
+      AUDIO_EXTS.some((ext) => fp.toLowerCase().endsWith(ext))
+    );
+    if (audioFiles.length > 0 && (!prompt || prompt.trim() === '添付ファイルを確認してください')) {
+      // 音声のみ or テキストなし → 自動書き起こし
+      try {
+        await message.reply('⏳ 音声を書き起こし中...');
+        for (const audioPath of audioFiles) {
+          const params = JSON.stringify({ audio_path: audioPath, source: 'discord' });
+          const raw = await execPython(
+            ['action_executor.py', '--action', 'voice_transcribe', '--params', params],
+            300000 // 5分タイムアウト (ASR処理時間)
+          );
+          const parsed = JSON.parse(raw);
+          const formatted = formatActionResult('voice_transcribe', parsed);
+          const chunks = splitMessage(formatted, 2000);
+          for (const chunk of chunks) {
+            await message.reply(chunk);
+          }
+        }
+      } catch (err) {
+        console.error('[xangi] Voice transcribe error:', err);
+        await message.reply('⚠️ 音声書き起こしに失敗しました: ' + String(err).slice(0, 200));
+      }
+      return; // 音声処理完了、LLM には渡さない
+    }
+
+    // === Video Pipeline: 動画添付自動解説 ===
+    const VIDEO_EXTS = ['.mp4', '.mov', '.webm', '.avi', '.mkv', '.m4v'];
+    const videoFiles = attachmentPaths.filter((fp) =>
+      VIDEO_EXTS.some((ext) => fp.toLowerCase().endsWith(ext))
+    );
+    if (videoFiles.length > 0) {
+      try {
+        await message.reply('⏳ 動画を分析中...(フレーム抽出+音声書き起こし)');
+        for (const videoPath of videoFiles) {
+          const params = JSON.stringify({ video_path: videoPath });
+          const raw = await execPython(
+            ['action_executor.py', '--action', 'video_analyze', '--params', params],
+            600000 // 10分タイムアウト (Vision+ASR)
+          );
+          const parsed = JSON.parse(raw);
+          const formatted = formatActionResult('video_analyze', parsed);
+          const chunks = splitMessage(formatted, 2000);
+          for (const chunk of chunks) {
+            await message.reply(chunk);
+          }
+        }
+      } catch (err) {
+        console.error('[xangi] Video analyze error:', err);
+        await message.reply('⚠️ 動画分析に失敗しました: ' + String(err).slice(0, 200));
+      }
+      return;
+    }
+
+    // === Phase 10C: Magika Guard — 添付ファイルスキャン ===
+    const magikaAttachmentWarnings: string[] = [];
+    if (attachmentPaths.length > 0) {
+      for (const filePath of attachmentPaths) {
+        try {
+          const scanResult = await checkWithMagika(filePath);
+          console.log(`[magika-guard] scan ${filePath}: ${scanResult.verdict}`);
+          if (scanResult.verdict === 'blocked') {
+            const msg = formatMagikaVerdict(
+              scanResult.verdict,
+              scanResult.reason,
+              filePath.split('/').pop() || filePath
+            );
+            if (msg) magikaAttachmentWarnings.push(msg);
+          } else if (scanResult.verdict === 'suspicious') {
+            const msg = formatMagikaVerdict(
+              scanResult.verdict,
+              scanResult.reason,
+              filePath.split('/').pop() || filePath
+            );
+            if (msg) magikaAttachmentWarnings.push(msg);
+          }
+        } catch (err) {
+          console.error(`[magika-guard] scan error for ${filePath}:`, err);
+        }
+      }
+    }
+
+    // ブロックされた添付がある場合はユーザーに通知して処理中断
+    const blockedAttachments = magikaAttachmentWarnings.filter((w) => w.includes('\u{1f6ab}'));
+    if (blockedAttachments.length > 0) {
+      await message.reply(blockedAttachments.join('\n'));
+      return;
+    }
+    // 疑わしい添付は警告をプロンプトコンテキストに追加
+    if (magikaAttachmentWarnings.length > 0) {
+      await message.reply(magikaAttachmentWarnings.join('\n'));
+    }
 
     // 添付ファイル情報をプロンプトに追加
     prompt = buildPromptWithAttachments(
@@ -1349,37 +3680,10 @@ async function main() {
 
     processingChannels.add(channelId);
     try {
-      const result = await processPrompt(
-        message,
-        agentRunner,
-        prompt,
-        skipPermissions,
-        channelId,
-        config
-      );
-
-      // AIの応答から !discord コマンドを検知して実行
-      if (result) {
-        const feedbackResults = await handleDiscordCommandsInResponse(result, message);
-
-        // フィードバック結果があればエージェントに再注入
-        if (feedbackResults.length > 0) {
-          const feedbackPrompt = `あなたが実行したコマンドの結果が返ってきました。この情報を踏まえて、元の会話の文脈に沿ってユーザーに返答してください。\n\n${feedbackResults.join('\n\n')}`;
-          console.log(`[xangi] Re-injecting ${feedbackResults.length} feedback result(s) to agent`);
-          const feedbackResult = await processPrompt(
-            message,
-            agentRunner,
-            feedbackPrompt,
-            skipPermissions,
-            channelId,
-            config
-          );
-          // 再注入後の応答にもコマンドがあれば処理（ただし再帰は1回のみ）
-          if (feedbackResult) {
-            await handleDiscordCommandsInResponse(feedbackResult, message);
-          }
-        }
-      }
+      await processPrompt(message, agentRunner, prompt, skipPermissions, channelId, config);
+      // [DISABLED] Discord-side command re-processing.
+      // Trigger feedback is handled inside runner.ts (lite mode).
+      // Re-enabling causes duplicate messages.
     } finally {
       processingChannels.delete(channelId);
     }
@@ -1405,22 +3709,6 @@ async function main() {
         throw new Error(`Channel not found: ${channelId}`);
       }
 
-      // プロンプト内の !discord send コマンドを先に直接実行
-      // （AIに渡すとコマンドが応答に含まれず実行されないため）
-      const promptCommands = extractDiscordSendFromPrompt(prompt);
-      for (const cmd of promptCommands.commands) {
-        console.log(`[scheduler] Executing discord command from prompt: ${cmd.slice(0, 80)}...`);
-        await handleDiscordCommand(cmd, undefined, channelId);
-      }
-
-      // !discord send 以外のテキストが残っていればAIに渡す
-      const remainingPrompt = promptCommands.remaining.trim();
-      if (!remainingPrompt) {
-        // コマンドのみのプロンプトだった場合、AIは不要
-        console.log('[scheduler] Prompt contained only discord commands, skipping agent');
-        return promptCommands.commands.map((c) => `✅ ${c.slice(0, 50)}`).join('\n');
-      }
-
       // 処理中メッセージを送信
       const thinkingMsg = await (
         channel as {
@@ -1430,7 +3718,7 @@ async function main() {
 
       try {
         // タイムスタンプをプロンプトの先頭に注入
-        let agentPrompt = remainingPrompt;
+        let agentPrompt = prompt;
         if (config.discord.injectTimestamp !== false) {
           const d = new Date();
           const now = d.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
@@ -1439,36 +3727,19 @@ async function main() {
         }
 
         // スケジューラーは毎回新規セッション（stateless）
-        // 会話の文脈継続は不要で、古いセッションIDによるresume失敗を防ぐ
+        const schedAppSessionId = ensureSession(channelId, {
+          platform: 'discord',
+          scope: 'scheduler',
+        });
         const { result, sessionId: newSessionId } = await agentRunner.run(agentPrompt, {
           skipPermissions: config.agent.config.skipPermissions ?? false,
           sessionId: undefined,
           channelId,
+          appSessionId: schedAppSessionId,
         });
 
         // スケジューラーのセッションは scheduler スコープで保存
         setSession(channelId, newSessionId, 'scheduler');
-
-        // AI応答内の !discord コマンドを処理（sourceMessage なし、channelIdをフォールバック）
-        const feedbackResults = await handleDiscordCommandsInResponse(result, undefined, channelId);
-
-        // フィードバック結果があればエージェントに再注入
-        if (feedbackResults.length > 0) {
-          const feedbackPrompt = `あなたが実行したコマンドの結果が返ってきました。この情報を踏まえて、元の会話の文脈に沿ってユーザーに返答してください。\n\n${feedbackResults.join('\n\n')}`;
-          console.log(
-            `[scheduler] Re-injecting ${feedbackResults.length} feedback result(s) to agent`
-          );
-          // フィードバックは直前のスケジューラーセッションを使う（同一タスク内の文脈継続）
-          const feedbackSession = getSession(channelId);
-          const feedbackRun = await agentRunner.run(feedbackPrompt, {
-            skipPermissions: config.agent.config.skipPermissions ?? false,
-            sessionId: feedbackSession,
-            channelId,
-          });
-          setSession(channelId, feedbackRun.sessionId, 'scheduler');
-          // 再注入後の応答にもコマンドがあれば処理
-          await handleDiscordCommandsInResponse(feedbackRun.result, undefined, channelId);
-        }
 
         // 結果を送信
         const filePaths = extractFilePaths(result);
@@ -1487,10 +3758,6 @@ async function main() {
         // 最初のパートは既存のthinkingMsgを編集して送信
         const firstChunks = splitMessage(messageParts[0], DISCORD_SAFE_LENGTH);
         await thinkingMsg.edit(firstChunks[0] || '✅');
-        // 最後に送信したメッセージIDを記録（スケジューラー経由）
-        if ('id' in thinkingMsg) {
-          lastSentMessageIds.set(channelId, (thinkingMsg as { id: string }).id);
-        }
         const ch = channel as { send: (content: string) => Promise<unknown> };
         // 最初のパートの残りチャンク
         for (let i = 1; i < firstChunks.length; i++) {
@@ -1550,9 +3817,10 @@ async function main() {
     console.log('[xangi] Slack bot started');
   }
 
-  if (!config.discord.enabled && !config.slack.enabled) {
+  const webChatEnabled = process.env.WEB_CHAT_ENABLED === 'true';
+  if (!config.discord.enabled && !config.slack.enabled && !webChatEnabled) {
     console.error(
-      '[xangi] No chat platform enabled. Set DISCORD_TOKEN or SLACK_BOT_TOKEN/SLACK_APP_TOKEN'
+      '[xangi] No chat platform enabled. Set DISCORD_TOKEN, SLACK_BOT_TOKEN/SLACK_APP_TOKEN, or WEB_CHAT_ENABLED=true'
     );
     process.exit(1);
   }
@@ -1564,6 +3832,11 @@ async function main() {
   const shutdown = () => {
     console.log('[xangi] Shutting down scheduler...');
     scheduler.stopAll();
+    try {
+      unlinkSync(pidFilePath);
+    } catch {
+      // PIDファイルが既に消えていても問題ない
+    }
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
@@ -1606,10 +3879,12 @@ async function handleSkill(
   try {
     const prompt = `スキル「${skillName}」を実行してください。${args ? `引数: ${args}` : ''}`;
     const sessionId = getSession(channelId);
+    const appSessionId = ensureSession(channelId, { platform: 'discord' });
     const { result, sessionId: newSessionId } = await agentRunner.run(prompt, {
       skipPermissions,
       sessionId,
       channelId,
+      appSessionId,
     });
 
     setSession(channelId, newSessionId);
@@ -1639,10 +3914,12 @@ async function handleSkillCommand(
   try {
     const prompt = `スキル「${skillName}」を実行してください。${args ? `引数: ${args}` : ''}`;
     const sessionId = getSession(channelId);
+    const appSessionId = ensureSession(channelId, { platform: 'discord' });
     const { result, sessionId: newSessionId } = await agentRunner.run(prompt, {
       skipPermissions,
       sessionId,
       channelId,
+      appSessionId,
     });
 
     setSession(channelId, newSessionId);
@@ -1658,167 +3935,32 @@ async function handleSkillCommand(
 }
 
 /**
- * テキストから !discord send コマンドを抽出し、残りのテキストを返す
- * スケジューラプロンプトからコマンドを分離するために使用
- * コードブロック内のコマンドは無視する
- */
-function extractDiscordSendFromPrompt(text: string): {
-  commands: string[];
-  remaining: string;
-} {
-  const lines = text.split('\n');
-  const commands: string[] = [];
-  const remainingLines: string[] = [];
-  let inCodeBlock = false;
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i];
-
-    if (line.trim().startsWith('```')) {
-      inCodeBlock = !inCodeBlock;
-      remainingLines.push(line);
-      i++;
-      continue;
-    }
-
-    if (inCodeBlock) {
-      remainingLines.push(line);
-      i++;
-      continue;
-    }
-
-    const trimmed = line.trim();
-    const sendMatch = trimmed.match(/^!discord\s+send\s+<#(\d+)>\s*(.*)/);
-    if (sendMatch) {
-      const firstLineContent = sendMatch[2] ?? '';
-      if (firstLineContent.trim() === '') {
-        // 暗黙マルチライン: 次のコマンド行まで吸収
-        const bodyLines: string[] = [];
-        let inBodyCodeBlock = false;
-        i++;
-        while (i < lines.length) {
-          const bodyLine = lines[i];
-          if (bodyLine.trim().startsWith('```')) {
-            inBodyCodeBlock = !inBodyCodeBlock;
-          }
-          if (
-            !inBodyCodeBlock &&
-            (bodyLine.trim().startsWith('!discord ') || bodyLine.trim().startsWith('!schedule'))
-          ) {
-            break;
-          }
-          bodyLines.push(bodyLine);
-          i++;
-        }
-        const fullMessage = bodyLines.join('\n').trim();
-        if (fullMessage) {
-          commands.push(`!discord send <#${sendMatch[1]}> ${fullMessage}`);
-        }
-        continue;
-      } else {
-        // 1行目にテキストあり → 続く行も吸収
-        const bodyLines2: string[] = [firstLineContent];
-        let inBodyCodeBlock2 = false;
-        i++;
-        while (i < lines.length) {
-          const bodyLine = lines[i];
-          if (bodyLine.trim().startsWith('```')) {
-            inBodyCodeBlock2 = !inBodyCodeBlock2;
-          }
-          if (
-            !inBodyCodeBlock2 &&
-            (bodyLine.trim().startsWith('!discord ') || bodyLine.trim().startsWith('!schedule'))
-          ) {
-            break;
-          }
-          bodyLines2.push(bodyLine);
-          i++;
-        }
-        const fullMessage2 = bodyLines2.join('\n').trimEnd();
-        commands.push(`!discord send <#${sendMatch[1]}> ${fullMessage2}`);
-        continue;
-      }
-    }
-
-    remainingLines.push(line);
-    i++;
-  }
-
-  return { commands, remaining: remainingLines.join('\n') };
-}
-
-/**
  * 表示用テキストからコマンド行を除去する（コードブロック内は残す）
- * SYSTEM_COMMAND:, !discord, !schedule で始まる行を除去
- * !discord send の複数行メッセージ（続く行）も除去
+ * SYSTEM_COMMAND: で始まる行を除去
  */
 function stripCommandsFromDisplay(text: string): string {
   const lines = text.split('\n');
   const result: string[] = [];
   let inCodeBlock = false;
-  let i = 0;
 
-  while (i < lines.length) {
-    const line = lines[i];
-
+  for (const line of lines) {
     if (line.trim().startsWith('```')) {
       inCodeBlock = !inCodeBlock;
       result.push(line);
-      i++;
       continue;
     }
 
     if (inCodeBlock) {
       result.push(line);
-      i++;
       continue;
     }
-
-    const trimmed = line.trim();
 
     // SYSTEM_COMMAND: 行を除去
-    if (trimmed.startsWith('SYSTEM_COMMAND:')) {
-      i++;
-      continue;
-    }
-
-    // !discord send の複数行対応: コマンド行と続く行を除去
-    const sendMatch = trimmed.match(/^!discord\s+send\s+<#\d+>\s*(.*)/);
-    if (sendMatch) {
-      // 続く行も除去（次のコマンド行まで）
-      i++;
-      let inBodyCodeBlock = false;
-      while (i < lines.length) {
-        const bodyLine = lines[i];
-        if (bodyLine.trim().startsWith('```')) {
-          inBodyCodeBlock = !inBodyCodeBlock;
-        }
-        if (
-          !inBodyCodeBlock &&
-          (bodyLine.trim().startsWith('!discord ') || bodyLine.trim().startsWith('!schedule'))
-        ) {
-          break;
-        }
-        i++;
-      }
-      continue;
-    }
-
-    // その他の !discord コマンド行を除去
-    if (trimmed.startsWith('!discord ')) {
-      i++;
-      continue;
-    }
-
-    // !schedule コマンド行を除去
-    if (trimmed === '!schedule' || trimmed.startsWith('!schedule ')) {
-      i++;
+    if (line.trim().startsWith('SYSTEM_COMMAND:')) {
       continue;
     }
 
     result.push(line);
-    i++;
   }
 
   return result.join('\n').trim();
@@ -1835,6 +3977,16 @@ async function processPrompt(
   let replyMessage: Message | null = null;
   const toolHistory: string[] = []; // ツール実行履歴（stop時にも参照するため関数スコープ）
   let lastStreamedText = ''; // エラー時に途中テキストを残すため関数スコープ
+  let memoryRecorded = false;
+  let memoryKind: ConversationMemoryKind = 'conversation';
+  let memoryAgent: string | undefined;
+  let memoryResult = '';
+  const markMemory = (kind: ConversationMemoryKind, result: string, agent?: string): void => {
+    memoryKind = kind;
+    memoryResult = result || '';
+    memoryAgent = agent;
+    memoryRecorded = true;
+  };
   try {
     // チャンネル・ユーザー情報をプロンプトに付与
     const channelName =
@@ -1847,9 +3999,300 @@ async function processPrompt(
     }
 
     console.log(`[xangi] Processing message in channel ${channelId}`);
+
+    // === Izuna Dispatch (Phase 7+8+9): Track A/B 事前振り分け + 直接実行 + Dev Agent ===
+    let dispatch: DispatchResult | null = null;
+    try {
+      const dispatchResult = await new Promise<string>((resolve, reject) => {
+        // チャンネル既定 agent があれば dispatch.py を飛ばして直接使う
+        const chDefault = channelDefaultDispatch(message.channelId);
+        if (chDefault) {
+          dispatch = chDefault;
+          console.log(`[izuna-dispatch] channel_default: ${dispatch.track}/${dispatch.agent}`);
+          resolve(JSON.stringify(dispatch));
+          return;
+        }
+        // メタデータ除去 + reply-to header 除去 (💬 返信元 ... のブロックを丸ごと削る)
+        // → dispatch 時にユーザー発言本体だけを見るため (返信コンテキストが誤マッチを誘発)
+        const dispatchPrompt = prompt
+          .replace(/\n*---\n*💬\s*返信元[\s\S]*?\n*---\n*/g, '')
+          .replace(/\[.*?\]\n/g, '')
+          .trim();
+        execFile(
+          'python3',
+          [pathJoin(ACTION_SCRIPTS_DIR, 'dispatch.py'), dispatchPrompt],
+          { timeout: 3000, cwd: ACTION_SCRIPTS_DIR },
+          (err, stdout, stderr) => {
+            if (err) {
+              reject(new Error(stderr || err.message));
+              return;
+            }
+            resolve(stdout);
+          }
+        );
+      });
+      dispatch = JSON.parse(dispatchResult) as DispatchResult;
+      if (dispatch.track && dispatch.agent) {
+        console.log(`[izuna-dispatch] ${dispatch.track}/${dispatch.agent} (${dispatch.mode})`);
+      }
+    } catch (err) {
+      console.error(
+        '[izuna-dispatch] error (fallback to LLM):',
+        err instanceof Error ? err.message : err
+      );
+    }
+
+    // === Phase 8.4: Calendar gate refinement ===
+    // 既に pending calendar_create gate があるチャンネルで、時刻/日付情報を含む
+    // 短い訂正発言 ("17時だよ今日の" 等) を受けたら、既存 gate を差し替える。
+    // create intent が無くても実行する (refinement はそもそも訂正なので).
+    try {
+      const TIME_HINT_RE = /\d+\s*時|\d+[:：]\d{2}|今日|明日|明後日|\d+\s*月\s*\d+/;
+      const pendingCal = Array.from(pendingGates.values()).find(
+        (g) => g.actionName === 'calendar_create' && g.channelId === channelId
+      );
+      if (pendingCal && TIME_HINT_RE.test(prompt) && prompt.length < 200) {
+        const entry = Array.from(pendingGates.entries()).find(([, g]) => g === pendingCal);
+        const raw = await execPython(
+          [
+            pathJoin(ACTION_SCRIPTS_DIR, 'agents', 'schedule_refine.py'),
+            '--prev',
+            pendingCal.paramsStr,
+            '--text',
+            prompt,
+          ],
+          8000
+        );
+        const parsed = JSON.parse(raw);
+        if (parsed.refined && parsed.params) {
+          console.log('[calendar-refine] refined:', parsed.params.summary, parsed.params.start);
+          // 旧 gate 削除 (メッセージは残すが token は無効化)
+          if (entry) {
+            pendingGates.delete(entry[0]);
+            if (pendingCal.token2) pendingL3SecondStep.delete(pendingCal.token2);
+          }
+          const actionText = `[ACTION:calendar_create ${JSON.stringify(parsed.params)}]`;
+          const gateSendFn = async (
+            content: string,
+            components?: ActionRowBuilder<ButtonBuilder>[]
+          ): Promise<Message | null> => {
+            if ('send' in message.channel) {
+              return (await (message.channel as any).send({
+                content,
+                components: components || [],
+              })) as Message;
+            }
+            return null;
+          };
+          await message.react('♻️').catch(() => {});
+          const { actionMessages } = await processIzunaActions(actionText, channelId, gateSendFn);
+          const replyText = actionMessages.join('\n') || '🔄 予定訂正を承認待ちに差し替え';
+          await message.reply(replyText);
+          markMemory('fast_path', replyText, 'calendar-agent');
+          return replyText;
+        }
+      }
+    } catch (err) {
+      console.error(
+        '[calendar-refine] error (continue normal flow):',
+        err instanceof Error ? err.message : err
+      );
+    }
+
+    // === Phase 8.5: Calendar deterministic fast path (LLM を完全スキップ) ===
+    // 自然文 → Python で即抽出 → ACTION タグ生成 → processIzunaActions でゲート UI。
+    // Gemma4 の出力ゆらぎを回避し、数秒レイテンシにする。
+    if (dispatch?.agent === 'calendar-agent') {
+      const promptLc = prompt.toLowerCase();
+      const CREATE_HINTS = [
+        '登録',
+        '入れとい',
+        '入れて',
+        '入れといて',
+        '追加',
+        '予約',
+        'よろしく',
+        'おねがい',
+        'お願い',
+        'セット',
+        'ブッキング',
+        'schedule',
+        'create',
+        'add',
+        'book',
+      ];
+      const hasCreate = CREATE_HINTS.some((k) => promptLc.includes(k.toLowerCase()));
+      if (hasCreate) {
+        try {
+          const raw = await execPython(
+            [pathJoin(ACTION_SCRIPTS_DIR, 'agents', 'schedule_from_text.py'), prompt],
+            8000
+          );
+          const parsed = JSON.parse(raw);
+          if (parsed.extracted && parsed.params) {
+            console.log('[calendar-fast] extracted:', parsed.params.summary, parsed.params.start);
+            const actionText = `[ACTION:calendar_create ${JSON.stringify(parsed.params)}]`;
+            const gateSendFn = async (
+              content: string,
+              components?: ActionRowBuilder<ButtonBuilder>[]
+            ): Promise<Message | null> => {
+              if ('send' in message.channel) {
+                return (await (message.channel as any).send({
+                  content,
+                  components: components || [],
+                })) as Message;
+              }
+              return null;
+            };
+            await message.react('⚡').catch(() => {});
+            const { actionMessages } = await processIzunaActions(actionText, channelId, gateSendFn);
+            const replyText = actionMessages.join('\n') || '⏳ 予定登録: 承認待ち';
+            await message.reply(replyText);
+            markMemory('fast_path', replyText, 'calendar-agent');
+            return replyText;
+          } else {
+            console.log('[calendar-fast] extract failed → LLM fallback');
+          }
+        } catch (err) {
+          console.error(
+            '[calendar-fast] error (fallback to LLM):',
+            err instanceof Error ? err.message : err
+          );
+        }
+      }
+    }
+
+    // === Phase 8: Worker 直接実行（LLM スキップ）===
+    if (dispatch?.track === 'worker' && dispatch.agent) {
+      try {
+        const directResult = await tryWorkerDirectExec(dispatch, prompt);
+        if (directResult) {
+          console.log(
+            `[izuna-worker-exec] Direct result for ${dispatch.agent} (${directResult.length} chars)`
+          );
+          recordAgentBusTask({
+            prompt,
+            dispatch,
+            status: 'completed',
+            result: directResult,
+            channelId,
+            metadata: { execution: 'worker_direct' },
+          });
+          await message.react('⚡').catch(() => {});
+          const workerChunks = splitMessage(directResult, DISCORD_SAFE_LENGTH);
+          await message.reply(workerChunks[0] || '✅');
+          if ('send' in message.channel && workerChunks.length > 1) {
+            const workerChannel = message.channel as unknown as {
+              send: (content: string) => Promise<unknown>;
+            };
+            for (let i = 1; i < workerChunks.length; i++) {
+              await workerChannel.send(workerChunks[i]);
+            }
+          }
+          markMemory('worker_exec', directResult, dispatch.agent);
+          return directResult;
+        }
+      } catch (err) {
+        console.error(
+          '[izuna-worker-exec] error (fallback to LLM):',
+          err instanceof Error ? err.message : err
+        );
+      }
+    }
+
+    // === Phase 9: Dev Agent スポーン（Claude Code を対象リポで実行）===
+    if (dispatch?.track === 'dev' && dispatch.agent) {
+      try {
+        await message.react('🔧').catch(() => {});
+        const devReply = await message.reply(
+          `🔧 ${dispatch.agent} を起動中... (repo スコープ実行)`
+        );
+        const devResult = await spawnDevAgent(dispatch, prompt, channelId, config);
+        if (devResult) {
+          console.log(`[izuna-dev-agent] Result for ${dispatch.agent} (${devResult.length} chars)`);
+          recordAgentBusTask({
+            prompt,
+            dispatch,
+            status: 'completed',
+            result: devResult,
+            channelId,
+            metadata: { execution: 'dev_agent' },
+          });
+          const chunks = splitMessage(devResult, DISCORD_SAFE_LENGTH);
+          await devReply.edit(chunks[0] || '完了');
+          if ('send' in message.channel && chunks.length > 1) {
+            const channel = message.channel as unknown as {
+              send: (content: string) => Promise<unknown>;
+            };
+            for (let i = 1; i < chunks.length; i++) {
+              await channel.send(chunks[i]);
+            }
+          }
+          markMemory('dev_task', devResult, dispatch.agent);
+          return devResult;
+        }
+        // dev agent が null を返した場合 → LLM フォールバック
+        await devReply
+          .edit('🔧 Dev agent のリポが見つかりません。LLM で処理します...')
+          .catch(() => {});
+      } catch (err) {
+        console.error(
+          '[izuna-dev-agent] error (fallback to LLM):',
+          err instanceof Error ? err.message : err
+        );
+      }
+    }
+
+    // Dispatch hint を LLM プロンプトに注入（直接実行できなかった場合のフォールバック）
+    if (dispatch?.track && dispatch?.agent) {
+      const dispatchHint = `\n[DISPATCH: track=${dispatch.track}, agent=${dispatch.agent}, mode=${dispatch.mode}, blast=${dispatch.blast_radius || 'unknown'}]`;
+      prompt = prompt + dispatchHint;
+    }
+
+    // === Phase 10A: Magika Guard — インストールキーワード事前チェック ===
+    if (containsInstallKeyword(prompt)) {
+      const pkgInfo = extractPackageInfo(prompt);
+      if (pkgInfo) {
+        try {
+          console.log(
+            `[magika-guard] Pre-check package: ${pkgInfo.manager}/${pkgInfo.packageName}`
+          );
+          const pkgResult = await checkPackageWithMagika(pkgInfo.manager, pkgInfo.packageName);
+          console.log(`[magika-guard] Package verdict: ${pkgResult.verdict}`);
+          if (pkgResult.verdict === 'blocked') {
+            const blockMsg = formatMagikaVerdict(
+              pkgResult.verdict,
+              pkgResult.reason,
+              `${pkgInfo.manager}:${pkgInfo.packageName}`
+            );
+            if (blockMsg) {
+              await message.reply(blockMsg);
+              return null;
+            }
+          } else if (pkgResult.verdict === 'suspicious') {
+            const warnMsg = formatMagikaVerdict(
+              pkgResult.verdict,
+              pkgResult.reason,
+              `${pkgInfo.manager}:${pkgInfo.packageName}`
+            );
+            if (warnMsg) {
+              await message.reply(warnMsg);
+              prompt += `\n[MAGIKA_WARNING: ${pkgInfo.manager}:${pkgInfo.packageName} — ${pkgResult.reason || 'suspicious'}]`;
+            }
+          }
+        } catch (err) {
+          console.error(
+            '[magika-guard] pre-check error:',
+            err instanceof Error ? err.message : err
+          );
+        }
+      }
+    }
+
     await message.react('👀').catch(() => {});
 
     const sessionId = getSession(channelId);
+    const appSessionId = ensureSession(channelId, { platform: 'discord' });
     const useStreaming = config.discord.streaming ?? true;
     const showThinking = config.discord.showThinking ?? true;
 
@@ -1887,12 +4330,13 @@ async function processPrompt(
         if (firstTextReceived) return;
         dotCount = (dotCount % 3) + 1;
         const dots = '.'.repeat(dotCount);
-        const toolDisplay = toolHistory.length > 0 ? '\n' + toolHistory.slice(-5).join('\n') : '';
+        const toolDisplay = toolHistory.length > 0 ? '\n' + toolHistory.join('\n') : '';
         replyMessage!.edit(`🤔 考え中${dots}${toolDisplay}`).catch(() => {});
       }, 1000);
 
       let streamResult: { result: string; sessionId: string };
       try {
+        const streamChannelAgent = channelDefaultDispatch(channelId)?.agent ?? undefined;
         streamResult = await agentRunner.runStream(
           prompt,
           {
@@ -1920,13 +4364,25 @@ async function processPrompt(
               // ツール実行履歴に追加
               const inputSummary = formatToolInput(toolName, toolInput);
               toolHistory.push(`🔧 ${toolName}${inputSummary}`);
+              const toolDisplay = toolHistory.join('\n');
               if (!firstTextReceived) {
-                const toolDisplay = toolHistory.slice(-5).join('\n');
                 replyMessage!.edit(`🤔 考え中...\n${toolDisplay}`).catch(() => {});
+              } else {
+                // テキストストリーミング中でもツール表示を更新
+                const currentText = lastStreamedText || '';
+                replyMessage!
+                  .edit(`${currentText}\n\n${toolDisplay} ▌`.slice(0, DISCORD_MAX_LENGTH))
+                  .catch(() => {});
               }
             },
           },
-          { skipPermissions, sessionId, channelId }
+          {
+            skipPermissions,
+            sessionId,
+            channelId,
+            appSessionId,
+            channelAgent: streamChannelAgent,
+          }
         );
       } finally {
         clearInterval(thinkingInterval);
@@ -1943,7 +4399,14 @@ async function processPrompt(
       }, 1000);
 
       try {
-        const runResult = await runner.run(prompt, { skipPermissions, sessionId, channelId });
+        const channelAgent = channelDefaultDispatch(channelId)?.agent ?? undefined;
+        const runResult = await runner.run(prompt, {
+          skipPermissions,
+          sessionId,
+          channelId,
+          channelAgent,
+          appSessionId,
+        });
         result = runResult.result;
         newSessionId = runResult.sessionId;
       } finally {
@@ -1952,16 +4415,128 @@ async function processPrompt(
     }
 
     setSession(channelId, newSessionId);
+    incrementMessageCount(appSessionId);
+    // 最初のメッセージでタイトル自動設定
+    if (!prompt.startsWith('[プラットフォーム:')) {
+      // メタデータ付きプロンプトからユーザーメッセージ部分を抽出
+    }
     console.log(
       `[xangi] Response length: ${result.length}, session: ${newSessionId.slice(0, 8)}...`
     );
+
+    // === Phase 10B: Magika Guard — LLM応答内のインストールコマンドチェック ===
+    try {
+      const responsePackages = extractInstallCommandsFromResponse(result);
+      if (responsePackages.length > 0) {
+        const warnings: string[] = [];
+        for (const pkg of responsePackages) {
+          try {
+            console.log(
+              `[magika-guard] Post-check package in response: ${pkg.manager}/${pkg.packageName}`
+            );
+            const pkgResult = await checkPackageWithMagika(pkg.manager, pkg.packageName);
+            console.log(`[magika-guard] Response package verdict: ${pkgResult.verdict}`);
+            const msg = formatMagikaVerdict(
+              pkgResult.verdict,
+              pkgResult.reason,
+              `${pkg.manager}:${pkg.packageName}`
+            );
+            if (msg) warnings.push(msg);
+          } catch (err) {
+            console.error(
+              `[magika-guard] post-check error for ${pkg.manager}:${pkg.packageName}:`,
+              err
+            );
+          }
+        }
+        if (warnings.length > 0) {
+          result += '\n\n' + warnings.join('\n');
+        }
+      }
+    } catch (err) {
+      console.error('[magika-guard] post-response check error:', err);
+    }
+
+    // === Izuna Action Hook (Phase 4): アクションマーカー検出・実行 ===
+    let izunaActionMessages: string[] = [];
+    try {
+      const gateSendFn = async (
+        content: string,
+        components?: ActionRowBuilder<ButtonBuilder>[]
+      ): Promise<Message | null> => {
+        if ('send' in message.channel) {
+          return (await (message.channel as any).send({
+            content,
+            components: components || [],
+          })) as Message;
+        }
+        return null;
+      };
+      const actionResult = await processIzunaActions(result, channelId, gateSendFn);
+      if (actionResult.actionMessages.length > 0) {
+        result = actionResult.cleanText;
+        izunaActionMessages = actionResult.actionMessages;
+        console.log('[xangi] Action executed:', izunaActionMessages);
+      }
+      // data carrying ACTION (memory_sample 等) の結果を LLM に流して要約を生成する。
+      // claude バックエンドの場合は session 継続で前ターン文脈も活きる。
+      if (actionResult.feedbackPayload) {
+        try {
+          const followupPrompt =
+            '### 直前のACTION実行結果(あなた自身の前ターンが起動した read-only 取得)\n' +
+            '```json\n' +
+            actionResult.feedbackPayload +
+            '\n```\n\n' +
+            '前ターンで空振りだと判断していても、その結論は破棄してください。' +
+            '今回ここに入っている結果だけを根拠に、いま取得できたデータとして再評価してください。' +
+            '上記の結果を踏まえてユーザー向けの自然文で簡潔に返してください。' +
+            '**新しい ACTION マーカーは絶対に出さない**。要約・整理だけを行う。';
+          console.log('[xangi] action feedback to LLM:', actionResult.feedbackPayload.slice(0, 80));
+          const followup = await agentRunner.run(followupPrompt, { channelId });
+          if (followup?.result) {
+            // 万が一 LLM が ACTION マーカーを出しても無視(実行しない)
+            const cleaned = String(followup.result).replace(ACTION_HOOK_RE, '').trim();
+            // 諦めモード検知: 実データを渡してるのに LLM が「データ無い/取得できません」系で返してきたら、
+            // 同 session の "空振り結論" が支配してる。次ターンに持ち越さないよう session を消す。
+            if (cleaned && looksLikeGiveUp(cleaned)) {
+              console.warn(
+                `[xangi] LLM gave up despite ${actionResult.feedbackPayload.length}b data — clearing session for ${channelId}`
+              );
+              if (typeof agentRunner.clearChannelSession === 'function') {
+                await agentRunner.clearChannelSession(channelId).catch(() => {});
+              }
+            }
+            if (cleaned) {
+              result = (result.trim() ? result.trim() + '\n\n' : '') + cleaned;
+              // claude が自然文で要約してくれたので、生イベントの追加メッセージは抑制
+              // (重複出力で UX を壊すのを防ぐ)
+              izunaActionMessages = [];
+            }
+          }
+        } catch (err) {
+          console.error('[xangi] action feedback retry failed:', err);
+        }
+      }
+    } catch (err) {
+      console.error('[xangi] action_hook error:', err);
+    }
+
+    if (dispatch?.track && dispatch.agent) {
+      recordAgentBusTask({
+        prompt,
+        dispatch,
+        status: 'completed',
+        result,
+        channelId,
+        metadata: { execution: 'llm_with_dispatch_hint' },
+      });
+    }
 
     // ファイルパスを抽出して添付送信
     const filePaths = extractFilePaths(result);
     const displayText = filePaths.length > 0 ? stripFilePaths(result) : result;
 
-    // SYSTEM_COMMAND: 行と !discord / !schedule コマンド行を表示テキストから除去
-    // コードブロック内のコマンドは残す（表示用テキストなので消さない）
+    // SYSTEM_COMMAND: 行を表示テキストから除去（コードブロック内は残す）
     const cleanText = stripCommandsFromDisplay(displayText);
 
     // === セパレータで明示的に分割（content-digest等で複数投稿を1応答に含める用途）
@@ -1980,9 +4555,17 @@ async function processPrompt(
       content: firstChunks[0] || '✅',
       ...(showButtons && { components: [createCompletedButtons()] }),
     });
-    // 最後に送信したメッセージIDを記録
-    if (replyMessage) {
-      lastSentMessageIds.set(message.channel.id, replyMessage.id);
+    try {
+      const topicResult = classifyTopic(prompt, result);
+      if (
+        message.channel.id === GENERAL_TEXT_CHANNEL_ID &&
+        topicResult.channelId &&
+        topicResult.topic !== 'general'
+      ) {
+        await replyMessage!.react(HANDOFF_EMOJI).catch(() => {});
+      }
+    } catch (err) {
+      console.error('[xangi] handoff reaction attach error:', err);
     }
     if ('send' in message.channel) {
       const channel = message.channel as unknown as {
@@ -2019,6 +4602,45 @@ async function processPrompt(
       }
     }
 
+    // === Izuna Action Results (Phase 4): アクション結果を追加メッセージで送信 ===
+    if (izunaActionMessages.length > 0 && 'send' in message.channel) {
+      const actionChannel = message.channel as unknown as {
+        send: (content: string) => Promise<unknown>;
+      };
+      for (const actionMsg of izunaActionMessages) {
+        // Discord 2000 字 limit 対応: splitMessage で分割送信
+        const actChunks = splitMessage(actionMsg, DISCORD_SAFE_LENGTH);
+        for (const chunk of actChunks) {
+          await actionChannel
+            .send(chunk)
+            .catch((e: any) => console.error('[xangi] action send error:', e));
+        }
+      }
+
+      // === Izuna Topic Router (Phase 5): 話題別チャンネルにログ転送 ===
+      try {
+        const topicResult = classifyTopic(prompt, result);
+        if (topicResult.channelId && topicResult.topic !== 'general') {
+          const topicChannel = await (message.client as any).channels
+            .fetch(topicResult.channelId)
+            .catch(() => null);
+          if (topicChannel && 'send' in topicChannel) {
+            const logMsg = `**[${topicResult.topic}]**\n> ${prompt.slice(0, 150)}\n\n${result
+              .replace(/\[ACTION:\w+(?:\s+\{[^\]]*\})?\]/g, '')
+              .trim()
+              .slice(0, 400)}`;
+            await (topicChannel as any)
+              .send(logMsg)
+              .catch((e: any) => console.error('[xangi] topic route error:', e));
+          }
+        }
+      } catch (err) {
+        console.error('[xangi] topic router error:', err);
+      }
+    }
+
+    markMemory('conversation', result);
+
     // AIの応答を返す（!discord コマンド処理用）
     return result;
   } catch (error) {
@@ -2032,6 +4654,7 @@ async function processPrompt(
           components: [],
         })
         .catch(() => {});
+      markMemory('cancelled', lastStreamedText || '🛑 停止');
       return null;
     }
     console.error('[xangi] Error:', error);
@@ -2070,10 +4693,12 @@ async function processPrompt(
         if (sessionId) {
           const followUpPrompt =
             '先ほどの処理がエラー（タイムアウト等）で中断されました。途中まで行った作業内容と現在の状況を簡潔に報告してください。';
+          const followUpAppId = getActiveSessionId(channelId);
           const followUpResult = await agentRunner.run(followUpPrompt, {
             skipPermissions,
             sessionId,
             channelId,
+            appSessionId: followUpAppId,
           });
           if (followUpResult.result) {
             setSession(channelId, followUpResult.sessionId);
@@ -2092,6 +4717,7 @@ async function processPrompt(
       }
     }
 
+    markMemory('error', errorDetail || errorMsg);
     return null;
   } finally {
     // 👀 リアクションを削除
@@ -2101,6 +4727,24 @@ async function processPrompt(
       .catch((err) => {
         console.error('[xangi] Failed to remove 👀 reaction:', err.message || err);
       });
+
+    // === Phase 6: 会話記憶を必ず一回保存（早期return / cancel / error すべて拾う） ===
+    if (memoryRecorded) {
+      recordConversationMemory({
+        channelId: message.channel.id,
+        prompt,
+        result: memoryResult,
+        kind: memoryKind,
+        agent: memoryAgent,
+      });
+    } else {
+      recordConversationMemory({
+        channelId: message.channel.id,
+        prompt,
+        result: lastStreamedText || '(no response captured)',
+        kind: 'error',
+      });
+    }
   }
 }
 
@@ -2139,99 +4783,6 @@ function handleSettingsFromResponse(text: string): void {
 }
 
 // ─── Schedule Handlers ──────────────────────────────────────────────
-
-async function handleScheduleCommand(
-  interaction: ChatInputCommandInteraction,
-  scheduler: Scheduler,
-  schedulerConfig?: { enabled: boolean; startupEnabled: boolean }
-): Promise<void> {
-  const subcommand = interaction.options.getSubcommand();
-  const channelId = interaction.channelId;
-
-  switch (subcommand) {
-    case 'add': {
-      const input = interaction.options.getString('input', true);
-      const parsed = parseScheduleInput(input);
-      if (!parsed) {
-        await interaction.reply({
-          content:
-            '❌ 入力を解析できませんでした\n\n' +
-            '**対応フォーマット:**\n' +
-            '• `30分後 メッセージ` — 相対時間\n' +
-            '• `15:00 メッセージ` — 時刻指定\n' +
-            '• `毎日 9:00 メッセージ` — 毎日定時\n' +
-            '• `毎週月曜 10:00 メッセージ` — 週次\n' +
-            '• `cron 0 9 * * * メッセージ` — cron式',
-          ephemeral: true,
-        });
-        return;
-      }
-
-      try {
-        const targetChannel = parsed.targetChannelId || channelId;
-        const schedule = scheduler.add({
-          ...parsed,
-          channelId: targetChannel,
-          platform: 'discord' as Platform,
-        });
-
-        const channelInfo = parsed.targetChannelId ? ` → <#${parsed.targetChannelId}>` : '';
-        const typeLabel = getTypeLabel(schedule.type, {
-          expression: schedule.expression,
-          runAt: schedule.runAt,
-          channelInfo,
-        });
-
-        await interaction.reply(
-          `✅ スケジュールを追加しました\n\n${typeLabel}\n📝 ${schedule.message}\n🆔 \`${schedule.id}\``
-        );
-      } catch (error) {
-        await interaction.reply({
-          content: `❌ ${error instanceof Error ? error.message : 'エラーが発生しました'}`,
-          ephemeral: true,
-        });
-      }
-      return;
-    }
-
-    case 'list': {
-      // 全スケジュールを表示（チャンネルでフィルタしない）
-      const schedules = scheduler.list();
-      const content = formatScheduleList(schedules, schedulerConfig);
-      if (content.length <= DISCORD_MAX_LENGTH) {
-        await interaction.reply(content.replaceAll(SCHEDULE_SEPARATOR, ''));
-      } else {
-        const chunks = splitScheduleContent(content, DISCORD_SAFE_LENGTH);
-        await interaction.reply(chunks[0]);
-        for (let i = 1; i < chunks.length; i++) {
-          await interaction.followUp(chunks[i]);
-        }
-      }
-      return;
-    }
-
-    case 'remove': {
-      const id = interaction.options.getString('id', true);
-      const removed = scheduler.remove(id);
-      await interaction.reply(
-        removed ? `🗑️ スケジュール \`${id}\` を削除しました` : `❌ ID \`${id}\` が見つかりません`
-      );
-      return;
-    }
-
-    case 'toggle': {
-      const id = interaction.options.getString('id', true);
-      const schedule = scheduler.toggle(id);
-      if (schedule) {
-        const status = schedule.enabled ? '✅ 有効' : '⏸️ 無効';
-        await interaction.reply(`${status} に切り替えました: \`${id}\``);
-      } else {
-        await interaction.reply(`❌ ID \`${id}\` が見つかりません`);
-      }
-      return;
-    }
-  }
-}
 
 async function handleScheduleMessage(
   message: Message,
@@ -2387,156 +4938,96 @@ async function handleScheduleMessage(
     await message.reply(`❌ ${error instanceof Error ? error.message : 'エラーが発生しました'}`);
   }
 }
-
-/**
- * AI応答内の !schedule コマンドを実行
- */
-async function executeScheduleFromResponse(
-  text: string,
-  sourceMessage: Message,
+async function handleScheduleCommand(
+  interaction: ChatInputCommandInteraction,
   scheduler: Scheduler,
   schedulerConfig?: { enabled: boolean; startupEnabled: boolean }
 ): Promise<void> {
-  const args = text.replace(/^!schedule\s*/, '').trim();
-  const channelId = sourceMessage.channel.id;
-  const channel = sourceMessage.channel;
+  const subcommand = interaction.options.getSubcommand();
+  const channelId = interaction.channelId;
 
-  // list コマンド（全件表示）
-  if (!args || args === 'list') {
-    const schedules = scheduler.list();
-    const content = formatScheduleList(schedules, schedulerConfig);
-    if ('send' in channel) {
-      const sendFn = (channel as { send: (content: string) => Promise<unknown> }).send.bind(
-        channel
-      );
-      // 2000文字制限対応: 分割送信
-      if (content.length <= DISCORD_MAX_LENGTH) {
-        await sendFn(content.replaceAll(SCHEDULE_SEPARATOR, ''));
-      } else {
-        const chunks = splitScheduleContent(content, DISCORD_SAFE_LENGTH);
-        for (const chunk of chunks) {
-          await sendFn(chunk);
-        }
-      }
-    }
-    return;
-  }
-
-  // remove コマンド（複数対応）
-  if (args.startsWith('remove ') || args.startsWith('delete ') || args.startsWith('rm ')) {
-    const parts = args.split(/\s+/).slice(1).filter(Boolean);
-    if (parts.length === 0) return;
-
-    const schedules = scheduler.list();
-    const deletedIds: string[] = [];
-
-    // 番号を大きい順にソート（削除時のずれを防ぐ）
-    const targets = parts
-      .map((p) => {
-        const num = parseInt(p, 10);
-        if (!isNaN(num) && num > 0 && !p.startsWith('sch_')) {
-          if (num > schedules.length) return null;
-          return { index: num, id: schedules[num - 1].id };
-        }
-        return { index: 0, id: p };
-      })
-      .filter((t): t is { index: number; id: string } => t !== null)
-      .sort((a, b) => b.index - a.index);
-
-    for (const target of targets) {
-      if (scheduler.remove(target.id)) {
-        deletedIds.push(target.id);
-      }
-    }
-
-    if ('send' in channel && deletedIds.length > 0) {
-      const remaining = scheduler.list();
-      const content = `✅ ${deletedIds.length}件削除しました\n\n${formatScheduleList(remaining, schedulerConfig)}`;
-      const sendFn = (channel as { send: (content: string) => Promise<unknown> }).send.bind(
-        channel
-      );
-      if (content.length <= DISCORD_MAX_LENGTH) {
-        await sendFn(content.replaceAll(SCHEDULE_SEPARATOR, ''));
-      } else {
-        const chunks = splitScheduleContent(content, DISCORD_SAFE_LENGTH);
-        for (const chunk of chunks) {
-          await sendFn(chunk);
-        }
-      }
-    }
-    return;
-  }
-
-  // toggle コマンド
-  if (args.startsWith('toggle ')) {
-    const idOrIndex = args.split(/\s+/)[1];
-    if (!idOrIndex) return;
-
-    let targetId = idOrIndex;
-    const indexNum = parseInt(idOrIndex, 10);
-    if (!isNaN(indexNum) && indexNum > 0 && !idOrIndex.startsWith('sch_')) {
-      const schedules = scheduler.list(channelId);
-      if (indexNum > schedules.length) {
-        if ('send' in channel) {
-          await (channel as { send: (content: string) => Promise<unknown> }).send(
-            `❌ 番号 ${indexNum} は範囲外です（1〜${schedules.length}）`
-          );
-        }
+  switch (subcommand) {
+    case 'add': {
+      const input = interaction.options.getString('input', true);
+      const parsed = parseScheduleInput(input);
+      if (!parsed) {
+        await interaction.reply({
+          content:
+            '❌ 入力を解析できませんでした\n\n' +
+            '**対応フォーマット:**\n' +
+            '• `30分後 メッセージ` — 相対時間\n' +
+            '• `15:00 メッセージ` — 時刻指定\n' +
+            '• `毎日 9:00 メッセージ` — 毎日定時\n' +
+            '• `毎週月曜 10:00 メッセージ` — 週次\n' +
+            '• `cron 0 9 * * * メッセージ` — cron式',
+          ephemeral: true,
+        });
         return;
       }
-      targetId = schedules[indexNum - 1].id;
-    }
 
-    const schedule = scheduler.toggle(targetId);
-    if ('send' in channel) {
-      if (schedule) {
-        const status = schedule.enabled ? '✅ 有効化' : '⏸️ 無効化';
-        const all = scheduler.list(channelId);
-        const listContent = formatScheduleList(all, schedulerConfig).replaceAll(
-          SCHEDULE_SEPARATOR,
-          ''
+      try {
+        const targetChannel = parsed.targetChannelId || channelId;
+        const schedule = scheduler.add({
+          ...parsed,
+          channelId: targetChannel,
+          platform: 'discord' as Platform,
+        });
+
+        const channelInfo = parsed.targetChannelId ? ` → <#${parsed.targetChannelId}>` : '';
+        const typeLabel = getTypeLabel(schedule.type, {
+          expression: schedule.expression,
+          runAt: schedule.runAt,
+          channelInfo,
+        });
+
+        await interaction.reply(
+          `✅ スケジュールを追加しました\n\n${typeLabel}\n📝 ${schedule.message}\n🆔 \`${schedule.id}\``
         );
-        await (channel as { send: (content: string) => Promise<unknown> }).send(
-          `${status}しました: ${targetId}\n\n${listContent}`
-        );
-      } else {
-        await (channel as { send: (content: string) => Promise<unknown> }).send(
-          `❌ ID \`${targetId}\` が見つかりません`
-        );
+      } catch (error) {
+        await interaction.reply({
+          content: `❌ ${error instanceof Error ? error.message : 'エラーが発生しました'}`,
+          ephemeral: true,
+        });
       }
+      return;
     }
-    return;
-  }
 
-  const input = args.startsWith('add ') ? args.replace(/^add\s+/, '') : args;
-  const parsed = parseScheduleInput(input);
-  if (!parsed) {
-    console.log(`[xangi] Failed to parse schedule input: ${input}`);
-    return;
-  }
+    case 'list': {
+      // 全スケジュールを表示（チャンネルでフィルタしない）
+      const schedules = scheduler.list();
+      const content = formatScheduleList(schedules, schedulerConfig);
+      if (content.length <= DISCORD_MAX_LENGTH) {
+        await interaction.reply(content.replaceAll(SCHEDULE_SEPARATOR, ''));
+      } else {
+        const chunks = splitScheduleContent(content, DISCORD_SAFE_LENGTH);
+        await interaction.reply(chunks[0]);
+        for (let i = 1; i < chunks.length; i++) {
+          await interaction.followUp(chunks[i]);
+        }
+      }
+      return;
+    }
 
-  try {
-    const targetChannel = parsed.targetChannelId || channelId;
-    const schedule = scheduler.add({
-      ...parsed,
-      channelId: targetChannel,
-      platform: 'discord' as Platform,
-    });
-
-    const channelInfo = parsed.targetChannelId ? ` → <#${parsed.targetChannelId}>` : '';
-    const typeLabel = getTypeLabel(schedule.type, {
-      expression: schedule.expression,
-      runAt: schedule.runAt,
-      channelInfo,
-    });
-
-    if ('send' in channel) {
-      await (channel as { send: (content: string) => Promise<unknown> }).send(
-        `✅ スケジュールを追加しました\n\n${typeLabel}\n📝 ${schedule.message}\n🆔 \`${schedule.id}\``
+    case 'remove': {
+      const id = interaction.options.getString('id', true);
+      const removed = scheduler.remove(id);
+      await interaction.reply(
+        removed ? `🗑️ スケジュール \`${id}\` を削除しました` : `❌ ID \`${id}\` が見つかりません`
       );
+      return;
     }
-  } catch (error) {
-    console.error('[xangi] Failed to add schedule from response:', error);
+
+    case 'toggle': {
+      const id = interaction.options.getString('id', true);
+      const schedule = scheduler.toggle(id);
+      if (schedule) {
+        const status = schedule.enabled ? '✅ 有効' : '⏸️ 無効';
+        await interaction.reply(`${status} に切り替えました: \`${id}\``);
+      } else {
+        await interaction.reply(`❌ ID \`${id}\` が見つかりません`);
+      }
+      return;
+    }
   }
 }
 

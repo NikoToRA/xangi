@@ -6,6 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "postbuild": "node -e \"require('child_process').execFileSync('/Users/suguru/venvs/izuna/bin/python3', ['/Users/suguru/projects/izuna-workspace/scripts/integrity_check.py', 'update'], { stdio: 'inherit' })\"",
     "dev": "tsx watch src/index.ts",
     "start": "node --env-file=.env dist/index.js",
     "test": "vitest run",
@@ -15,7 +16,9 @@
     "format": "prettier --write src/",
     "format:check": "prettier --check src/",
     "typecheck": "tsc --noEmit",
-    "prepare": "husky"
+    "prepare": "husky",
+    "prestart": "npm run build",
+    "xangi-cmd": "node --env-file=.env dist/cli/xangi-cmd.js"
   },
   "lint-staged": {
     "src/**/*.ts": [
