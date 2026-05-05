@@ -80,6 +80,12 @@ export class GeminiRunner implements AgentRunner {
   }
 
   async run(prompt: string, options?: RunOptions): Promise<RunResult> {
+    if (options?.channelAgent) {
+      console.warn(
+        `[gemini-runner] channelAgent="${options.channelAgent}" set but ChannelLock is ` +
+          `localLLM-only currently (no injection for gemini-cli).`
+      );
+    }
     const systemPrompt = buildSystemPrompt();
     const fullPrompt = systemPrompt ? `${systemPrompt}\n\n---\n\n${prompt}` : prompt;
     const args = [
@@ -96,8 +102,8 @@ export class GeminiRunner implements AgentRunner {
     console.log(`[gemini] Executing in ${this.workdir || 'default dir'}${sessionInfo}`);
 
     // トランスクリプトログ: 送信プロンプトを記録
-    if (options?.channelId && this.workdir) {
-      logPrompt(this.workdir, options.channelId, fullPrompt, options?.sessionId);
+    if (options?.appSessionId && this.workdir) {
+      logPrompt(this.workdir, options.appSessionId, fullPrompt);
     }
 
     try {
@@ -105,8 +111,8 @@ export class GeminiRunner implements AgentRunner {
       const response = this.parseJsonResponse(stdout);
 
       // トランスクリプトログ: 応答を記録
-      if (options?.channelId && this.workdir) {
-        logResponse(this.workdir, options.channelId, {
+      if (options?.appSessionId && this.workdir) {
+        logResponse(this.workdir, options.appSessionId, {
           result: response.response,
           sessionId: sessionId || response.session_id,
         });
@@ -131,8 +137,8 @@ export class GeminiRunner implements AgentRunner {
         const response = this.parseJsonResponse(stdout);
 
         // トランスクリプトログ: リトライ応答を記録
-        if (options?.channelId && this.workdir) {
-          logResponse(this.workdir, options.channelId, {
+        if (options?.appSessionId && this.workdir) {
+          logResponse(this.workdir, options.appSessionId, {
             result: response.response,
             sessionId: sessionId || response.session_id,
           });
@@ -153,10 +159,14 @@ export class GeminiRunner implements AgentRunner {
   ): Promise<{ stdout: string; sessionId: string }> {
     const safeEnv = getSafeEnv();
     return new Promise((resolve, reject) => {
+      const childEnv: NodeJS.ProcessEnv = { ...safeEnv, ...getGitHubEnv(safeEnv) };
+      if (channelId) {
+        childEnv.XANGI_CHANNEL_ID = channelId;
+      }
       const proc = spawn('gemini', args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: this.workdir,
-        env: { ...safeEnv, ...getGitHubEnv(safeEnv) },
+        env: childEnv,
       });
       this.currentProcess = proc;
 
@@ -245,12 +255,12 @@ export class GeminiRunner implements AgentRunner {
     console.log(`[gemini] Streaming in ${this.workdir || 'default dir'}${sessionInfo}`);
 
     // トランスクリプトログ: 送信プロンプトを記録
-    if (options?.channelId && this.workdir) {
-      logPrompt(this.workdir, options.channelId, fullPrompt, options?.sessionId);
+    if (options?.appSessionId && this.workdir) {
+      logPrompt(this.workdir, options.appSessionId, fullPrompt);
     }
 
     try {
-      return await this.executeStream(args, callbacks, options?.channelId);
+      return await this.executeStream(args, callbacks, options?.channelId, options?.appSessionId);
     } catch (err) {
       // セッションresume失敗時は新規セッションでリトライ
       if (options?.sessionId && err instanceof Error && err.message.includes('exited with code')) {
@@ -262,7 +272,7 @@ export class GeminiRunner implements AgentRunner {
           '--output-format',
           'stream-json',
         ];
-        return this.executeStream(retryArgs, callbacks, options?.channelId);
+        return this.executeStream(retryArgs, callbacks, options?.channelId, options?.appSessionId);
       }
       throw err;
     }
@@ -271,14 +281,19 @@ export class GeminiRunner implements AgentRunner {
   private executeStream(
     args: string[],
     callbacks: StreamCallbacks,
-    channelId?: string
+    channelId?: string,
+    appSessionId?: string
   ): Promise<RunResult> {
     const safeEnv = getSafeEnv();
     return new Promise((resolve, reject) => {
+      const childEnv: NodeJS.ProcessEnv = { ...safeEnv, ...getGitHubEnv(safeEnv) };
+      if (channelId) {
+        childEnv.XANGI_CHANNEL_ID = channelId;
+      }
       const proc = spawn('gemini', args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: this.workdir,
-        env: { ...safeEnv, ...getGitHubEnv(safeEnv) },
+        env: childEnv,
       });
       this.currentProcess = proc;
 
@@ -379,8 +394,8 @@ export class GeminiRunner implements AgentRunner {
         const result: RunResult = { result: fullText, sessionId };
 
         // トランスクリプトログ: 応答を記録
-        if (channelId && this.workdir) {
-          logResponse(this.workdir, channelId, { result: fullText, sessionId });
+        if (appSessionId && this.workdir) {
+          logResponse(this.workdir, appSessionId, { result: fullText, sessionId });
         }
 
         callbacks.onComplete?.(result);

@@ -3,7 +3,10 @@ import path from 'path';
 import os from 'os';
 
 const DOWNLOAD_DIR = path.join(
-  process.env.DATA_DIR || path.join(os.homedir(), '.xangi'),
+  process.env.DATA_DIR ||
+    (process.env.WORKSPACE_PATH
+      ? path.join(process.env.WORKSPACE_PATH, '.xangi')
+      : path.join(os.homedir(), '.xangi')),
   'media',
   'attachments'
 );
@@ -56,7 +59,7 @@ export function extractFilePaths(text: string): string[] {
 
   // 絶対パスパターン（画像/音声/動画の拡張子を持つもの）
   const absPathPattern =
-    /(?:^|\s)(\/[^\s]+\.(?:png|jpg|jpeg|gif|webp|mp3|mp4|wav|flac|pdf|zip))/gim;
+    /(?:^|\s)(\/[^\s]+\.(?:png|jpg|jpeg|gif|webp|mp3|mp4|wav|flac|pdf|zip|md|txt|json))/gim;
   while ((match = absPathPattern.exec(text)) !== null) {
     const p = match[1].trim();
     if (fs.existsSync(p) && !paths.includes(p)) {

@@ -16,17 +16,21 @@ export interface AgentConfig {
   idleTimeoutMs?: number;
 }
 
+export type EffortLevel = 'low' | 'medium' | 'high' | 'max';
+
 export interface Config {
   discord: {
     enabled: boolean;
     token: string;
     allowedUsers?: string[];
     autoReplyChannels?: string[];
+    autoReplyAll?: boolean;
     streaming?: boolean;
     showThinking?: boolean;
     injectChannelTopic?: boolean;
     injectTimestamp?: boolean;
     showButtons?: boolean;
+    allowAutoreplyCommand?: boolean;
   };
   slack: {
     enabled: boolean;
@@ -42,6 +46,10 @@ export interface Config {
     backend: AgentBackend;
     config: AgentConfig;
     platform?: ChatPlatform;
+    /** 切り替え許可バックエンド一覧（未設定=全て許可） */
+    allowedBackends?: AgentBackend[];
+    /** 切り替え許可モデル一覧（未設定=全て許可） */
+    allowedModels?: string[];
   };
   scheduler: {
     enabled: boolean;
@@ -56,9 +64,12 @@ export function loadConfig(): Config {
   const slackBotToken = process.env.SLACK_BOT_TOKEN;
   const slackAppToken = process.env.SLACK_APP_TOKEN;
 
-  // 少なくともどちらかが有効である必要がある
-  if (!discordToken && !slackBotToken) {
-    throw new Error('DISCORD_TOKEN or SLACK_BOT_TOKEN environment variable is required');
+  // 少なくともどちらかが有効である必要がある（WebChatのみでもOK）
+  const webChatEnabled = process.env.WEB_CHAT_ENABLED === 'true';
+  if (!discordToken && !slackBotToken && !webChatEnabled) {
+    throw new Error(
+      'DISCORD_TOKEN, SLACK_BOT_TOKEN, or WEB_CHAT_ENABLED=true environment variable is required'
+    );
   }
 
   const discordAllowedUser = process.env.DISCORD_ALLOWED_USER;
@@ -111,6 +122,23 @@ export function loadConfig(): Config {
       : 30 * 60 * 1000, // 30分
   };
 
+  // ALLOWED_BACKENDS / ALLOWED_MODELS パース
+  const allowedBackendsRaw = process.env.ALLOWED_BACKENDS;
+  const allowedBackends: AgentBackend[] | undefined = allowedBackendsRaw
+    ? (allowedBackendsRaw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean) as AgentBackend[])
+    : undefined;
+
+  const allowedModelsRaw = process.env.ALLOWED_MODELS;
+  const allowedModels: string[] | undefined = allowedModelsRaw
+    ? allowedModelsRaw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : undefined;
+
   return {
     discord: {
       enabled: !!discordToken,
@@ -120,11 +148,13 @@ export function loadConfig(): Config {
         process.env.AUTO_REPLY_CHANNELS?.split(',')
           .map((s) => s.trim())
           .filter(Boolean) || [],
+      autoReplyAll: process.env.AUTO_REPLY_ALL === 'true',
       streaming: process.env.DISCORD_STREAMING !== 'false',
       showThinking: process.env.DISCORD_SHOW_THINKING !== 'false',
       injectChannelTopic: process.env.INJECT_CHANNEL_TOPIC !== 'false', // デフォルトON
       injectTimestamp: process.env.INJECT_TIMESTAMP !== 'false', // デフォルトON
       showButtons: process.env.DISCORD_SHOW_BUTTONS !== 'false', // デフォルトON
+      allowAutoreplyCommand: process.env.ALLOW_AUTOREPLY_COMMAND !== 'false', // デフォルトON
     },
     slack: {
       enabled: !!slackBotToken && !!slackAppToken,
@@ -143,6 +173,8 @@ export function loadConfig(): Config {
       backend,
       config: agentConfig,
       platform,
+      allowedBackends,
+      allowedModels,
     },
     scheduler: {
       enabled: process.env.SCHEDULER_ENABLED !== 'false', // デフォルトで有効
