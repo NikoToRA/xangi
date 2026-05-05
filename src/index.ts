@@ -91,6 +91,10 @@ const ACTION_HOOK_RE = /\[ACTION:(\w+)(?:\s*(\{[\s\S]*?\}))?\s*\]?/g;
 //   - **ました (過去形) は意図的に外す** — 完了報告は ACTION 必須ではない
 //   - [しり]? は する系 (登録します) / 五段 (作ります) の活用差を吸収
 //   - 🦊 (Izuna 署名) も末尾許容
+// codex review (2026-05-05) P1 fix: bare 「る」終止形は連体修飾 (作る手順, 入れる方法) を
+// 拾って情報説明文を誤検知する。後ろに名詞が続く場合は除外する negative lookahead を追加。
+// 連体修飾の典型語: 手順 方法 やり方 流れ 機能 コツ スキル ステップ プロセス 場合 際 時 とき こと もの 例 必要 際は ときは
+const _DICT_FORM_GUARD = '(?![手方や流機コスステプ場際時とこも例必])';
 const DECLARATION_RULES: Array<{
   label: string;
   phrase: RegExp;
@@ -98,39 +102,47 @@ const DECLARATION_RULES: Array<{
 }> = [
   {
     label: 'notion_todo',
-    phrase:
-      /(?:Notion|タスク|Todo)[^\n。]{0,40}?(?:入れ|登録|追加|作)(?:[しり]?ます|る|ます🦊?|ておきます|ておく)/,
+    phrase: new RegExp(
+      `(?:Notion|タスク|Todo)[^\\n。]{0,40}?(?:入れ|登録|追加|作)(?:[しり]?ます|る${_DICT_FORM_GUARD}|ます🦊?|ておきます|ておく)`
+    ),
     expected: ['notion_todo_create'],
   },
   {
     label: 'mail_draft',
-    phrase:
-      /(?:下書き|返信下書き|メール返信|Gmail|メール)[^\n。]{0,40}?(?:作|準備|生成|書|下書き|添付)(?:[しり]?ます|る|ます🦊?|ておきます)/,
+    phrase: new RegExp(
+      `(?:下書き|返信下書き|メール返信|Gmail|メール)[^\\n。]{0,40}?(?:作|準備|生成|書|下書き|添付)(?:[しり]?ます|る${_DICT_FORM_GUARD}|ます🦊?|ておきます)`
+    ),
     // busicom_order / mail_with_meeting も draft 生成系なので expected に含める (構成 skill が draft を作る)
     expected: ['gmail_draft', 'mail_reply', 'busicom_order', 'mail_with_meeting'],
   },
   {
     label: 'calendar_create',
-    phrase:
-      /(?:予定|カレンダー|スケジュール|MTG|ミーティング|Meet)[^\n。]{0,40}?(?:入れ|登録|追加|作成|発行|設定)(?:[しり]?ます|る|ます🦊?|ておきます)/,
+    phrase: new RegExp(
+      `(?:予定|カレンダー|スケジュール|MTG|ミーティング|Meet)[^\\n。]{0,40}?(?:入れ|登録|追加|作成|発行|設定)(?:[しり]?ます|る${_DICT_FORM_GUARD}|ます🦊?|ておきます)`
+    ),
     // mail_with_meeting も calendar 作成を内包する composition なので OK
     expected: ['calendar_create', 'mail_with_meeting'],
   },
   {
     label: 'commitment_complete',
-    phrase:
-      /(?:約束|対応|タスク)[^\n。]{0,30}?(?:完了|done|消化|済|終わ)(?:[しり]?ます|に(?:し|なり)ます|る|ました)/,
+    phrase: new RegExp(
+      `(?:約束|対応|タスク)[^\\n。]{0,30}?(?:完了|done|消化|済|終わ)(?:[しり]?ます|に(?:し|なり)ます|る${_DICT_FORM_GUARD}|ました)`
+    ),
     expected: ['commitment_complete'],
   },
   {
     label: 'wiki_add',
-    phrase: /wiki[^\n。]{0,40}?(?:登録|追加|更新|記録|保存)(?:[しり]?ます|る|ます🦊?|ておきます)/i,
+    phrase: new RegExp(
+      `wiki[^\\n。]{0,40}?(?:登録|追加|更新|記録|保存)(?:[しり]?ます|る${_DICT_FORM_GUARD}|ます🦊?|ておきます)`,
+      'i'
+    ),
     expected: ['wiki_add'],
   },
   {
     label: 'mail_dismiss',
-    phrase:
-      /(?:未対応|未返信)(?:の)?メール[^\n。]{0,30}?(?:非表示|dismiss)(?:[しり]?ます|る|ます🦊?|ておきます)/,
+    phrase: new RegExp(
+      `(?:未対応|未返信)(?:の)?メール[^\\n。]{0,30}?(?:非表示|dismiss)(?:[しり]?ます|る${_DICT_FORM_GUARD}|ます🦊?|ておきます)`
+    ),
     expected: ['mail_dismiss'],
   },
 ];
@@ -444,6 +456,113 @@ function looksLikeGiveUp(text: string): boolean {
   return GIVE_UP_PATTERNS.some((re) => re.test(text));
 }
 
+/**
+ * calendar_create + (gmail_draft|mail_reply) が同一ターンで出ている場合、
+ * mail_with_meeting 1 個に bundle する。
+ * 「返信と予定作成」で LLM が 2 個に分けて出してしまった時の安全弁。
+ * 1 承認で予定+Meet+下書きすべて確定するようになる。
+ *
+ * 失敗 (params 不足等) なら null を返し、元の 2 ACTION 経路に fallback。
+ */
+function tryBundleCalendarAndMail(
+  matches: RegExpExecArray[]
+): { mergedText: string; mergedMatches: RegExpExecArray[] } | null {
+  if (matches.length < 2) return null;
+
+  let calMatch: RegExpExecArray | null = null;
+  let mailMatch: RegExpExecArray | null = null;
+  let mailKind: 'gmail_draft' | 'mail_reply' | null = null;
+  const others: RegExpExecArray[] = [];
+
+  for (const m of matches) {
+    const name = m[1];
+    if (name === 'calendar_create' && !calMatch) {
+      calMatch = m;
+    } else if ((name === 'gmail_draft' || name === 'mail_reply') && !mailMatch) {
+      mailMatch = m;
+      mailKind = name;
+    } else {
+      others.push(m);
+    }
+  }
+
+  if (!calMatch || !mailMatch || !mailKind) return null;
+
+  let calParams: Record<string, unknown>;
+  let mailParams: Record<string, unknown>;
+  try {
+    calParams = JSON.parse(calMatch[2] || '{}');
+    mailParams = JSON.parse(mailMatch[2] || '{}');
+  } catch (err) {
+    console.warn('[bundle] JSON parse failed, skip merge:', err);
+    return null;
+  }
+
+  // 必須項目チェック
+  const summary = String(calParams.summary || '');
+  const start = String(calParams.start || '');
+  const toRaw = String(mailParams.to || mailParams.to_email || '');
+  if (!summary || !start || !toRaw) {
+    console.warn('[bundle] missing required fields (summary/start/to), skip merge');
+    return null;
+  }
+
+  // 2 経路:
+  //  - gmail_draft: 本文 (body) を主から受け取る → body_template 経路。`[MEET_URL]` 注入。
+  //  - mail_reply: context (返信意図ヒント) → mail_with_meeting agent 側で
+  //    mail_reply_workflow を経由して履歴+Notion+LLM の高品質本文を生成。
+  //    bundler ここでテンプレ化すると mail_reply 本来の品質を失う。
+  let bodyTemplate = '';
+  let mergedContext = '';
+  if (mailKind === 'gmail_draft') {
+    const explicitBody = String(mailParams.body || '');
+    const hasPlaceholder =
+      explicitBody.includes('[MEET_URL]') || explicitBody.includes('{meet_url}');
+    bodyTemplate = hasPlaceholder
+      ? explicitBody
+      : explicitBody.replace(/\n*$/, '') + '\n\n参加 URL: [MEET_URL]\n';
+  } else {
+    mergedContext = String(mailParams.context || '').trim();
+  }
+
+  // subject 推定
+  const subject =
+    String(mailParams.subject || '').trim() ||
+    (summary.startsWith('Re:') ? summary : `Re: ${summary}`);
+
+  const merged: Record<string, unknown> = {
+    to_email: toRaw,
+    to_name: mailParams.to_name || mailParams.name || '',
+    subject,
+    summary,
+    start,
+  };
+  if (bodyTemplate) merged.body_template = bodyTemplate;
+  if (mergedContext) merged.context = mergedContext;
+  if (calParams.duration_min) merged.duration_min = calParams.duration_min;
+  if (calParams.end) merged.end = calParams.end;
+  if (calParams.attendees) merged.attendees = calParams.attendees;
+  if (calParams.location) merged.location = calParams.location;
+  if (calParams.calendar) merged.calendar_name = calParams.calendar;
+  if (mailParams.in_reply_to) merged.in_reply_to = mailParams.in_reply_to;
+
+  const mergedAction = `[ACTION:mail_with_meeting ${JSON.stringify(merged)}]`;
+  const otherActions = others.map((m) => m[0]);
+  const mergedText = [mergedAction, ...otherActions].join('\n');
+
+  console.log(
+    `[bundle] merged calendar_create + ${mailKind} → mail_with_meeting (1 gate, ${otherActions.length} other ACTION(s))`
+  );
+  // matches 配列を再生成 (RegExpExecArray 型を維持するため exec ループ)
+  const re = /\[ACTION:(\w+)(?:\s*(\{[\s\S]*?\}))?\s*\]?/g;
+  const mergedMatches: RegExpExecArray[] = [];
+  let exec: RegExpExecArray | null;
+  while ((exec = re.exec(mergedText)) !== null) {
+    mergedMatches.push(exec);
+  }
+  return { mergedText, mergedMatches };
+}
+
 async function processIzunaActions(
   text: string,
   channelId: string,
@@ -454,7 +573,15 @@ async function processIzunaActions(
   userPrompt?: string
 ): Promise<{ cleanText: string; actionMessages: string[]; feedbackPayload?: string }> {
   cleanupExpiredGates();
-  const matches = [...text.matchAll(ACTION_HOOK_RE)];
+  let matches = [...text.matchAll(ACTION_HOOK_RE)];
+
+  // bundle: calendar_create + mail_reply/gmail_draft → mail_with_meeting に書き換え (1 承認化)
+  const bundleResult = tryBundleCalendarAndMail(matches);
+  if (bundleResult) {
+    matches = bundleResult.mergedMatches;
+    text = bundleResult.mergedText;
+  }
+
   if (matches.length === 0) return { cleanText: text, actionMessages: [] };
   const cleanText = text.replace(ACTION_HOOK_RE, '').trim();
   const actionMessages: string[] = [];
@@ -2536,7 +2663,20 @@ async function main() {
           });
           return;
         }
-        await interaction.deferUpdate().catch(() => {});
+        // 即座にボタンを disable して「✅ 承認済み・処理中…」に差し替える (UX: クリック確認)
+        // double-click 抑止と「押したか不安」問題の両方を解消する。
+        try {
+          const pressedRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+              .setCustomId('gate_processing_dummy')
+              .setLabel('\u2705 \u627f\u8a8d\u6e08\u307f\u30fb\u51e6\u7406\u4e2d\u2026')
+              .setStyle(ButtonStyle.Success)
+              .setDisabled(true)
+          );
+          await interaction.update({ components: [pressedRow] });
+        } catch {
+          await interaction.deferUpdate().catch(() => {});
+        }
 
         // gate_responder に "ok" を送る
         const resp = await respondToGate(token, gate.hashPrefix, 'ok');
@@ -2597,7 +2737,19 @@ async function main() {
           });
           return;
         }
-        await interaction.deferUpdate().catch(() => {});
+        // 即座にボタンを disable して「❌ 拒否済み」に差し替える (UX: クリック確認)
+        try {
+          const deniedRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+              .setCustomId('gate_denied_dummy')
+              .setLabel('\u274c \u62d2\u5426\u6e08\u307f')
+              .setStyle(ButtonStyle.Danger)
+              .setDisabled(true)
+          );
+          await interaction.update({ components: [deniedRow] });
+        } catch {
+          await interaction.deferUpdate().catch(() => {});
+        }
 
         // gate_responder に "no" を送る
         await respondToGate(token, null, 'no');
@@ -5049,11 +5201,13 @@ async function processPrompt(
         console.warn(
           `[action-mismatch] ${mismatches.length} missing: ${labels} (emitted: ${emitted})`
         );
+        // P2 fix (codex review): 複数候補を `|` 連結すると `\w+` 正規表現で取れず修復失敗。
+        // 候補ごとに別記述してどれか 1 つを出してもらう。
         const declaredLines = mismatches
-          .map(
-            (mm, i) =>
-              `  ${i + 1}. 「${mm.matchedText}」 → \`[ACTION:${mm.expected.join('|')} {...}]\``
-          )
+          .map((mm, i) => {
+            const opts = mm.expected.map((a) => `\`[ACTION:${a} {...}]\``).join(' または ');
+            return `  ${i + 1}. 「${mm.matchedText}」 → ${opts}`;
+          })
           .join('\n');
         const fixPrompt =
           `あなたが直前で送ったメッセージには **${mismatches.length} 件の宣言** が含まれていました。\n` +
