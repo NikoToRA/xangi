@@ -73,6 +73,102 @@ import { join as pathJoin } from 'path';
 const lastSentMessageIds = new Map<string, string>();
 
 const ACTION_HOOK_RE = /\[ACTION:(\w+)(?:\s*(\{[\s\S]*?\}))?\s*\]?/g;
+
+// === Action Declaration Mismatch Detector (CLAUDE.md §7-bis 機械実装) ===
+// LLM (claude -p Izuna) が「○○します」と本文で宣言しながら対応する [ACTION:...]
+// マーカーを出さない事象が頻発 (2026-05-05 観測: 田岡先生メール / 補助金申請 / ビジコム鎌田 で連発)。
+// 検知時は 1 度だけ再 prompt し、欠落した ACTION マーカーを追補する。
+//
+// CLAUDE.md §7-bis の宣言フレーズ ↔ 期待 ACTION 対応表を機械化:
+//   - 「Notion に登録 / タスク入れる / Todo 作る」 → notion_todo_create
+//   - 「メール下書き作る / 返信下書き」          → gmail_draft / mail_reply
+//   - 「予定入れる / カレンダー登録 / Meet 付き」  → calendar_create
+//   - 「○○ wiki に登録 / 更新」                → wiki_add
+//   - 「対応済 / 約束終わった」                 → commitment_complete
+//   - 「未対応メール非表示」                    → mail_dismiss
+// Pattern 設計:
+//   - 「名詞 [^\n。]{0,40}? 動詞語幹 + ます/る/ておきます」を連鎖検出
+//   - **ました (過去形) は意図的に外す** — 完了報告は ACTION 必須ではない
+//   - [しり]? は する系 (登録します) / 五段 (作ります) の活用差を吸収
+//   - 🦊 (Izuna 署名) も末尾許容
+const DECLARATION_RULES: Array<{
+  label: string;
+  phrase: RegExp;
+  expected: string[];
+}> = [
+  {
+    label: 'notion_todo',
+    phrase:
+      /(?:Notion|タスク|Todo)[^\n。]{0,40}?(?:入れ|登録|追加|作)(?:[しり]?ます|る|ます🦊?|ておきます|ておく)/,
+    expected: ['notion_todo_create'],
+  },
+  {
+    label: 'mail_draft',
+    phrase:
+      /(?:下書き|返信下書き|メール返信|Gmail|メール)[^\n。]{0,40}?(?:作|準備|生成|書|下書き|添付)(?:[しり]?ます|る|ます🦊?|ておきます)/,
+    // busicom_order / mail_with_meeting も draft 生成系なので expected に含める (構成 skill が draft を作る)
+    expected: ['gmail_draft', 'mail_reply', 'busicom_order', 'mail_with_meeting'],
+  },
+  {
+    label: 'calendar_create',
+    phrase:
+      /(?:予定|カレンダー|スケジュール|MTG|ミーティング|Meet)[^\n。]{0,40}?(?:入れ|登録|追加|作成|発行|設定)(?:[しり]?ます|る|ます🦊?|ておきます)/,
+    // mail_with_meeting も calendar 作成を内包する composition なので OK
+    expected: ['calendar_create', 'mail_with_meeting'],
+  },
+  {
+    label: 'commitment_complete',
+    phrase:
+      /(?:約束|対応|タスク)[^\n。]{0,30}?(?:完了|done|消化|済|終わ)(?:[しり]?ます|に(?:し|なり)ます|る|ました)/,
+    expected: ['commitment_complete'],
+  },
+  {
+    label: 'wiki_add',
+    phrase: /wiki[^\n。]{0,40}?(?:登録|追加|更新|記録|保存)(?:[しり]?ます|る|ます🦊?|ておきます)/i,
+    expected: ['wiki_add'],
+  },
+  {
+    label: 'mail_dismiss',
+    phrase:
+      /(?:未対応|未返信)(?:の)?メール[^\n。]{0,30}?(?:非表示|dismiss)(?:[しり]?ます|る|ます🦊?|ておきます)/,
+    expected: ['mail_dismiss'],
+  },
+];
+
+interface DeclarationMismatch {
+  label: string;
+  matchedText: string;
+  expected: string[];
+  emittedActions: string[];
+}
+
+// 全 missing 検出 (combo 対応): メール+予定+Meet などの 3 連 declared を 1 retry で補完できるよう
+// detectAllDeclarationMismatches がリスト返却。後方互換のため detectDeclarationMismatch は first 返却を維持。
+function detectAllDeclarationMismatches(text: string): DeclarationMismatch[] {
+  const emittedActions: string[] = [];
+  let m: RegExpExecArray | null;
+  const re = /\[ACTION:(\w+)/g;
+  while ((m = re.exec(text)) !== null) {
+    emittedActions.push(m[1]);
+  }
+  const out: DeclarationMismatch[] = [];
+  const seenLabels = new Set<string>();
+  for (const rule of DECLARATION_RULES) {
+    const match = rule.phrase.exec(text);
+    if (!match) continue;
+    if (rule.expected.some((a) => emittedActions.includes(a))) continue;
+    if (seenLabels.has(rule.label)) continue;
+    seenLabels.add(rule.label);
+    out.push({
+      label: rule.label,
+      matchedText: match[0],
+      expected: rule.expected,
+      emittedActions,
+    });
+  }
+  return out;
+}
+
 const ACTION_SCRIPTS_DIR = pathJoin(process.env.HOME || '', '.openclaw/workspace/scripts');
 const GATE_RESPONDER_PATH = pathJoin(ACTION_SCRIPTS_DIR, 'gate_responder.py');
 const ACTION_EXECUTOR_PATH = pathJoin(ACTION_SCRIPTS_DIR, 'action_executor.py');
@@ -354,7 +450,8 @@ async function processIzunaActions(
   sendFn: (
     content: string,
     components?: ActionRowBuilder<ButtonBuilder>[]
-  ) => Promise<Message | null>
+  ) => Promise<Message | null>,
+  userPrompt?: string
 ): Promise<{ cleanText: string; actionMessages: string[]; feedbackPayload?: string }> {
   cleanupExpiredGates();
   const matches = [...text.matchAll(ACTION_HOOK_RE)];
@@ -362,8 +459,16 @@ async function processIzunaActions(
   const cleanText = text.replace(ACTION_HOOK_RE, '').trim();
   const actionMessages: string[] = [];
   let feedbackPayload: string | undefined;
-  for (const m of matches.slice(0, 1)) {
+  // combo (mail+calendar+meet 等) を 1 ターンで処理するため最大 5 ACTION まで実行。
+  // 同種重複は最初の 1 つだけ採用 (LLM が同 action を 2 回出した場合の保険)。
+  const seenActions = new Set<string>();
+  for (const m of matches.slice(0, 5)) {
     const actionName = m[1];
+    if (seenActions.has(actionName)) {
+      console.warn(`[izuna-actions] duplicate ACTION "${actionName}" skipped`);
+      continue;
+    }
+    seenActions.add(actionName);
     const paramsStr = m[2] || '{}';
     try {
       // Step 1: Gate tier 判定
@@ -436,6 +541,16 @@ async function processIzunaActions(
         );
         const parsed = JSON.parse(result);
         actionMessages.push(formatActionResult(actionName, parsed));
+        // QW3: failure を type=failure で L1 に書き戻す (Reflexion-lite)
+        if (parsed?.ok === false) {
+          recordDispatchFailure({
+            channelId,
+            prompt: userPrompt || '',
+            agent: 'izuna',
+            action: actionName,
+            error: parsed.error || JSON.stringify(parsed).slice(0, 300),
+          });
+        }
         // data carrying ACTION の結果は LLM に再注入して要約させる
         if (parsed?.ok && DATA_FEEDBACK_ACTIONS.has(actionName)) {
           try {
@@ -449,6 +564,14 @@ async function processIzunaActions(
       }
     } catch (err: any) {
       actionMessages.push('\u26a0\ufe0f ' + actionName + ': ' + err.message);
+      // QW3: 実行例外も failure として記録
+      recordDispatchFailure({
+        channelId,
+        prompt: userPrompt || '',
+        agent: 'izuna',
+        action: actionName,
+        error: `exception: ${err.message || String(err)}`,
+      });
     }
   }
   return { cleanText, actionMessages, feedbackPayload };
@@ -653,6 +776,34 @@ async function tryWorkerDirectExec(
     ? pattern.keywords.some((kw) => promptLower.includes(kw.toLowerCase()))
     : false;
 
+  // mail-agent: 構成 skill (busicom_order 等) が必要な複雑文脈なら process_starred 短絡せず LLM に委ねる。
+  // 「ビジコム」「注文書」「発注書」「PDF」「添付」等が含まれる時は busicom_order 等の ACTION を出させる。
+  if (dispatch.agent === 'mail-agent') {
+    const MAIL_COMPLEX_HINTS = [
+      'ビジコム',
+      'busicom',
+      '注文書',
+      '発注書',
+      '請求書',
+      'PDF',
+      'pdf',
+      '添付',
+      '鎌田',
+      '蒲田',
+      '瀬野',
+      'po', // purchase order
+    ];
+    const hasComplexIntent = MAIL_COMPLEX_HINTS.some((k) =>
+      rawPrompt.toLowerCase().includes(k.toLowerCase())
+    );
+    if (hasComplexIntent) {
+      console.log(
+        '[izuna-worker-exec] mail-agent: complex intent detected (busicom_order 等) → LLM fallback'
+      );
+      return null;
+    }
+  }
+
   // calendar-agent: create 意図ワードが混ざっていたら list へ短絡せず LLM に委ねる
   // (SOUL.md の `[ACTION:calendar_create ...]` 形式で summary/start/location を抽出させる)
   if (dispatch.agent === 'calendar-agent') {
@@ -668,6 +819,10 @@ async function tryWorkerDirectExec(
       'お願い',
       'セット',
       'ブッキング',
+      'meet',
+      'ミーティング',
+      '会議',
+      'zoom',
       'schedule',
       'create',
       'add',
@@ -678,6 +833,38 @@ async function tryWorkerDirectExec(
     );
     if (hasCreateIntent) {
       console.log('[izuna-worker-exec] calendar-agent: create intent detected → LLM fallback');
+      return null;
+    }
+  }
+
+  // notion-manager: create 意図ワードが混ざっていたら list (notion_tasks) へ短絡せず LLM に委ねる
+  // (SOUL_actions.md の `[ACTION:notion_todo_create ...]` で title/priority/due/project を抽出させる)
+  if (dispatch.agent === 'notion-manager') {
+    const NOTION_CREATE_HINTS = [
+      '登録',
+      '入れとい',
+      '入れて',
+      '入れといて',
+      '追加',
+      '作って',
+      '作る',
+      'やる',
+      'やっとい',
+      '後で',
+      '明日',
+      'todo',
+      'P0',
+      'P1',
+      'P2',
+      'priority',
+      'create',
+      'add',
+    ];
+    const hasCreateIntent = NOTION_CREATE_HINTS.some((k) =>
+      rawPrompt.toLowerCase().includes(k.toLowerCase())
+    );
+    if (hasCreateIntent) {
+      console.log('[izuna-worker-exec] notion-manager: create intent detected → LLM fallback');
       return null;
     }
   }
@@ -1651,6 +1838,57 @@ interface ConversationMemoryParams {
   kind: ConversationMemoryKind;
   agent?: string;
   metadata?: Record<string, unknown>;
+}
+
+// QW3 (Reflexion-lite): dispatch / ACTION 失敗を type=failure で L1 に書き戻す。
+// memory_curator.should_promote_l2 は type=failure を L2 昇格対象として保持しているので、
+// 同じ失敗を 2 度繰り返さないための context として retrieval から拾えるようになる。
+interface DispatchFailureParams {
+  channelId: string;
+  prompt: string;
+  agent?: string; // worker agent 名 / 'izuna' (LLM emitted ACTION)
+  action?: string; // ACTION 名 (busicom_order, calendar_create, ...)
+  error: string;
+}
+
+function recordDispatchFailure(p: DispatchFailureParams): void {
+  try {
+    if (!p.error || p.error.trim().length < 1) return;
+    const promptSnippet = (p.prompt || '').slice(0, 400);
+    const errorSnippet = p.error.slice(0, 600);
+    const action = p.action || 'unknown';
+    const agent = p.agent || 'izuna';
+    const content = `[user] ${promptSnippet}\n[failure] action=${action} agent=${agent}\nerror: ${errorSnippet}`;
+    const args = [
+      pathJoin(ACTION_SCRIPTS_DIR, 'memory_curator.py'),
+      'record',
+      '--agent',
+      agent,
+      '--type',
+      'failure',
+      '--content',
+      content,
+      '--source-type',
+      'discord',
+      '--session-id',
+      p.channelId || '',
+      '--tags',
+      'dispatch_failure',
+      action,
+      agent,
+    ];
+    execFile(
+      'python3',
+      args,
+      { timeout: 5000, cwd: ACTION_SCRIPTS_DIR },
+      (err, _stdout, stderr) => {
+        if (err) console.error('[izuna-memory] failure record error:', stderr || err.message);
+        else console.log(`[izuna-memory] failure recorded action=${action} agent=${agent}`);
+      }
+    );
+  } catch (err) {
+    console.error('[izuna-memory] recordDispatchFailure error:', err);
+  }
 }
 
 function recordConversationMemory(params: ConversationMemoryParams): void {
@@ -4412,7 +4650,12 @@ async function processPrompt(
             return null;
           };
           await message.react('♻️').catch(() => {});
-          const { actionMessages } = await processIzunaActions(actionText, channelId, gateSendFn);
+          const { actionMessages } = await processIzunaActions(
+            actionText,
+            channelId,
+            gateSendFn,
+            prompt
+          );
           const replyText = actionMessages.join('\n') || '🔄 予定訂正を承認待ちに差し替え';
           await message.reply(replyText);
           markMemory('fast_path', replyText, 'calendar-agent');
@@ -4472,7 +4715,12 @@ async function processPrompt(
               return null;
             };
             await message.react('⚡').catch(() => {});
-            const { actionMessages } = await processIzunaActions(actionText, channelId, gateSendFn);
+            const { actionMessages } = await processIzunaActions(
+              actionText,
+              channelId,
+              gateSendFn,
+              prompt
+            );
             const replyText = actionMessages.join('\n') || '⏳ 予定登録: 承認待ち';
             await message.reply(replyText);
             markMemory('fast_path', replyText, 'calendar-agent');
@@ -4788,6 +5036,51 @@ async function processPrompt(
       console.error('[magika-guard] post-response check error:', err);
     }
 
+    // === Action Declaration Mismatch Detector (P0, 2026-05-05) ===
+    // LLM が「○○します」と本文で宣言しながら [ACTION:...] マーカーを出さない問題を
+    // 1 度だけ再 prompt して全 missing をまとめて追補する。CLAUDE.md §7-bis の機械的補強。
+    // multi-action コンボ (mail+calendar+meet 等) も 1 retry で全部出させる。
+    try {
+      const mismatches = detectAllDeclarationMismatches(result);
+      if (mismatches.length > 0) {
+        const labels = mismatches.map((mm) => mm.label).join(', ');
+        const allExpected = Array.from(new Set(mismatches.flatMap((mm) => mm.expected)));
+        const emitted = mismatches[0].emittedActions.join(',') || 'none';
+        console.warn(
+          `[action-mismatch] ${mismatches.length} missing: ${labels} (emitted: ${emitted})`
+        );
+        const declaredLines = mismatches
+          .map(
+            (mm, i) =>
+              `  ${i + 1}. 「${mm.matchedText}」 → \`[ACTION:${mm.expected.join('|')} {...}]\``
+          )
+          .join('\n');
+        const fixPrompt =
+          `あなたが直前で送ったメッセージには **${mismatches.length} 件の宣言** が含まれていました。\n` +
+          `しかし対応する ACTION マーカーが出ていません (CLAUDE.md §7-bis 違反)。\n\n` +
+          `不足している宣言:\n${declaredLines}\n\n` +
+          `**今ターン、本文や前置きは不要、 \`[ACTION:...]\` マーカー行だけを出してください**。\n` +
+          `候補 action: ${allExpected.join(' / ')}。複数必要なら **複数行で全部** 出すこと。\n` +
+          `params は SOUL_actions.md の該当行を参照、必須項目だけで OK (任意項目は省略可)。\n` +
+          `予定にミーティング/Meet が含まれるなら calendar_create で \`with_meet:true\` を付ける。`;
+        const fixResult = await agentRunner.run(fixPrompt, { channelId });
+        if (fixResult?.result) {
+          const fixed = String(fixResult.result);
+          const newActionLines = fixed.match(/\[ACTION:\w+(?:\s+\{[\s\S]*?\})?\s*\]?/g) ?? [];
+          if (newActionLines.length > 0) {
+            result = result + '\n\n' + newActionLines.join('\n');
+            console.log(
+              `[action-mismatch] retry produced ${newActionLines.length} ACTION line(s) (needed ${mismatches.length}), appended`
+            );
+          } else {
+            console.warn('[action-mismatch] retry returned no ACTION marker either, giving up');
+          }
+        }
+      }
+    } catch (err) {
+      console.error('[action-mismatch] detector error:', err);
+    }
+
     // === Izuna Action Hook (Phase 4): アクションマーカー検出・実行 ===
     let izunaActionMessages: string[] = [];
     try {
@@ -4803,7 +5096,7 @@ async function processPrompt(
         }
         return null;
       };
-      const actionResult = await processIzunaActions(result, channelId, gateSendFn);
+      const actionResult = await processIzunaActions(result, channelId, gateSendFn, prompt);
       if (actionResult.actionMessages.length > 0) {
         result = actionResult.cleanText;
         izunaActionMessages = actionResult.actionMessages;
