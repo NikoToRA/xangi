@@ -145,6 +145,24 @@ const DECLARATION_RULES: Array<{
     ),
     expected: ['mail_dismiss'],
   },
+  {
+    // 2026-05-05 追加: 「明日17:30にメンション投げます」「リマインダー入れておきます」系
+    // discord_remind handler が xangi Scheduler に schedules.json を file-watch 投げる構成
+    label: 'discord_remind',
+    phrase: new RegExp(
+      `(?:リマインド|リマインダー|メンション|アラート|コール)[^\\n。]{0,30}?(?:入れ|送|投げ|セット|設定|発|出|登録|通知)(?:[しり]?ます|る${_DICT_FORM_GUARD}|ます🦊?|ておきます|ておく|しておきます)`
+    ),
+    expected: ['discord_remind'],
+  },
+  {
+    // 2026-05-05 追加: 「記事ネタとして保存します」「アイデアにメモしておきます」系
+    // idea_save handler は jsonl + izuna_events('idea') に記録 (memory_recall で引ける)
+    label: 'idea_save',
+    phrase: new RegExp(
+      `(?:アイデア|記事ネタ|ひらめき|着想|問題意識)[^\\n。]{0,30}?(?:保存|記録|残|メモ|ノート)(?:[しり]?ます|る${_DICT_FORM_GUARD}|ます🦊?|ておきます|ておく|しておきます)`
+    ),
+    expected: ['idea_save'],
+  },
 ];
 
 interface DeclarationMismatch {
@@ -1637,28 +1655,17 @@ async function handleDevIzunaMessage(message: Message): Promise<void> {
   const stage = status.stage;
 
   if (!status.active) {
-    // 即時受付通知 (LLM ranking または auto-continue 判定に 5-15秒、無音にしない)
+    // Phase 2c: #dev-izuna は handoff 専用化。
+    // 自然文 → claude_dev start (Notion 探索 + repo ranking) は無効化。
+    // 理由: 一般 Izuna が plan + 文脈を持っており、ここで再探索するのは無駄打ち。
+    // active session 無しなら repo 名・数字・自然文すべて hint を返すだけ。
     await ch
       .send(
-        `🔍 受付: \`${raw.slice(0, 80)}${raw.length > 80 ? '…' : ''}\`\n` +
-          `_(repo 解析中・続きなら自動継続)_`
+        '🛑 `#dev-izuna` は handoff 専用です。\n' +
+          '<#1492792411204882535> で plan を作って 🚀 リアクションで送ってください。\n' +
+          '_(active セッションが無い状態では新規タスク受付しません。`!status` で確認可)_'
       )
       .catch(() => {});
-    const r = await runClaudeDevSync(['start', raw], 90_000);
-    // auto_dispatching: 即時スピナーを返したので、長時間 spawn で実際の dev を開始
-    if (r.stage === 'auto_dispatching' && r.repo) {
-      await postChunked(ch, r.message || '(no response)');
-      await dispatchClaudeDevResume(ch, '__auto__');
-      return;
-    }
-    if (r.stage === 'awaiting_route' && Array.isArray(r.options) && r.options.length > 0) {
-      const { messageId } = await postRouteOptions(ch, r.message || '(no response)', r.options);
-      if (messageId) {
-        await runClaudeDevSync(['track-message', messageId]).catch(() => null);
-      }
-    } else {
-      await postChunked(ch, r.message || '(no response)');
-    }
     return;
   }
 
@@ -2015,6 +2022,60 @@ function recordDispatchFailure(p: DispatchFailureParams): void {
     );
   } catch (err) {
     console.error('[izuna-memory] recordDispatchFailure error:', err);
+  }
+}
+
+// (c) 2026-05-05: declaration mismatch detector の telemetry。発生率・retry 成否を events に
+// 残して日次/週次で改善度を追える。daily digest や reflection で集計可能。
+interface ActionMismatchTelemetryParams {
+  channelId: string;
+  labels: string[];
+  expected: string[];
+  emitted: string[];
+  matchedTexts: string[];
+  retryStatus: 'success' | 'failure';
+  retryActionCount: number;
+}
+
+function recordActionMismatch(p: ActionMismatchTelemetryParams): void {
+  try {
+    const content =
+      `[mismatch] labels=${p.labels.join(',')} retry=${p.retryStatus} ` +
+      `produced=${p.retryActionCount}\n` +
+      `declared: ${p.matchedTexts.map((t) => `「${t}」`).join(' / ')}\n` +
+      `expected: ${p.expected.join(' / ')}\n` +
+      `emitted_initially: ${p.emitted.join(',') || 'none'}`;
+    const tags = ['action_mismatch', `retry_${p.retryStatus}`, ...p.labels];
+    const args = [
+      pathJoin(ACTION_SCRIPTS_DIR, 'memory_curator.py'),
+      'record',
+      '--agent',
+      'izuna',
+      '--type',
+      'action_mismatch',
+      '--content',
+      content,
+      '--source-type',
+      'discord',
+      '--session-id',
+      p.channelId || '',
+      '--tags',
+      ...tags,
+    ];
+    execFile(
+      'python3',
+      args,
+      { timeout: 5000, cwd: ACTION_SCRIPTS_DIR },
+      (err, _stdout, stderr) => {
+        if (err) console.error('[action-mismatch] telemetry record error:', stderr || err.message);
+        else
+          console.log(
+            `[action-mismatch] telemetry recorded retry=${p.retryStatus} labels=${p.labels.join(',')}`
+          );
+      }
+    );
+  } catch (err) {
+    console.error('[action-mismatch] recordActionMismatch error:', err);
   }
 }
 
@@ -3668,6 +3729,13 @@ async function main() {
     '🎙': 'both',
   };
   const PUBLISH_AUDIO_EXTS = ['.ogg', '.opus', '.wav', '.mp3', '.m4a', '.flac', '.webm'];
+
+  // === Idea save reaction (💡 / 🧠) ===
+  // 任意チャンネル・任意発言者のメッセージを主のアイデアとして即保存。
+  const IDEA_REACTION_EMOJIS = new Set(['💡', '🧠']);
+  const processedIdeaMessages = new Set<string>();
+  // 🚀 dev_task handoff dedup (Phase 2a)
+  const processedDevTaskMessages = new Set<string>();
   client.on(Events.MessageReactionAdd, async (reaction, user) => {
     if (user.bot) return;
     const allowed = config.discord.allowedUsers || [];
@@ -3682,6 +3750,194 @@ async function main() {
     }
 
     const emojiName = reaction.emoji.name || '';
+
+    // === Idea save リアクション (💡 / 🧠) ===
+    // 任意チャンネル / 任意発言者の発言を主のアイデアとして即保存。
+    // 同じ message_id への二重発火は in-memory set で skip。
+    if (IDEA_REACTION_EMOJIS.has(emojiName)) {
+      const ideaMsg = reaction.message;
+      const msgId = ideaMsg.id;
+      if (processedIdeaMessages.has(msgId)) return;
+      processedIdeaMessages.add(msgId);
+      try {
+        const content = String(ideaMsg.content || '').trim();
+        let replyContext = '';
+        const ref = (ideaMsg as any).reference;
+        if (ref?.messageId) {
+          try {
+            const refChannelId = ref.channelId || ideaMsg.channel.id;
+            const refChannel = await ideaMsg.client.channels.fetch(refChannelId).catch(() => null);
+            if (refChannel && 'messages' in refChannel) {
+              const original = await (refChannel as any).messages
+                .fetch(ref.messageId)
+                .catch(() => null);
+              if (original) replyContext = String(original.content || '').slice(0, 1500);
+            }
+          } catch (err) {
+            console.error('[xangi] idea_save reply_context fetch failed:', err);
+          }
+        }
+        if (!content && !replyContext) {
+          await ideaMsg.reply?.('⚠️ 保存対象の本文が空でした').catch(() => {});
+          return;
+        }
+        const channelName =
+          (ideaMsg.channel as any).name || (!ideaMsg.guild ? 'DM' : ideaMsg.channel.id);
+        const params = JSON.stringify({
+          content: content || replyContext,
+          source_event_id: msgId,
+          channel: channelName,
+          reply_context: content ? replyContext : '',
+        });
+        const raw = await execPython(
+          ['action_executor.py', '--action', 'idea_save', '--params', params],
+          30000
+        );
+        const parsed = JSON.parse(raw);
+        if (parsed.ok) {
+          const id = parsed.id || '?';
+          const tag = parsed.skipped ? '既保存' : '保存';
+          await ideaMsg.reply?.(`💡 ${tag} (id: \`${id}\`)`).catch(() => {});
+        } else {
+          await ideaMsg
+            .reply?.('⚠️ idea_save 失敗: ' + String(parsed.error || '').slice(0, 200))
+            .catch(() => {});
+        }
+      } catch (err) {
+        console.error('[xangi] idea_save error:', err);
+        await reaction.message
+          .reply?.('⚠️ idea_save 失敗: ' + String(err).slice(0, 200))
+          .catch(() => {});
+      }
+      return;
+    }
+
+    // === 🚀 dev_task handoff リアクション (Phase 2a) ===
+    // 任意チャンネルで Izuna が提案した plan メッセージに 🚀 を付けると、
+    // - plan 本文 = reacted message の content
+    // - task = 直近の user 発言 (最大 10 件遡る)
+    // を action_executor.dev_task に渡し、#dev-izuna に envelope 投函する。
+    // CLAUDE.md §7-ter: Izuna は plan 提示で止まり、ACTION 自分で出さない。リアクション handoff が正規ルート。
+    if (emojiName === '🚀') {
+      // Izuna 自身の plan 投稿のみ対象 (他人や user 発言の handoff は禁止)
+      if (reaction.message.author?.id !== client.user?.id) return;
+      // dev-izuna は既に独自 workflow があるので除外
+      if (reaction.message.channel.id === DEV_IZUNA_CHANNEL_ID) return;
+      const handoffMsgId = reaction.message.id;
+      if (processedDevTaskMessages.has(handoffMsgId)) return;
+      processedDevTaskMessages.add(handoffMsgId);
+
+      const planText = String(reaction.message.content || '').trim();
+      if (planText.length < 20) {
+        await reaction.message
+          .reply(
+            '⚠️ plan が短すぎます (<20 chars)。Izuna の plan 提案メッセージにリアクションしてください'
+          )
+          .catch(() => {});
+        processedDevTaskMessages.delete(handoffMsgId); // retry 可
+        return;
+      }
+
+      // 直近の user 発言から task コンテキストを取る
+      let taskText = '';
+      try {
+        const ch: any = reaction.message.channel;
+        const recent = await ch.messages.fetch({ before: handoffMsgId, limit: 10 });
+        const userMsg = recent.find((m: any) => {
+          if (m.author.bot) return false;
+          if (allowed.includes('*')) return true;
+          return allowed.includes(m.author.id);
+        });
+        if (userMsg) {
+          taskText = String(userMsg.content || '').slice(0, 500);
+        }
+      } catch (err) {
+        console.error('[xangi] dev_task handoff: fetch user msg failed:', err);
+      }
+      if (!taskText) {
+        taskText = '(直近 user 発言なし、plan 単独で実行)';
+      }
+
+      try {
+        const params = JSON.stringify({
+          task: taskText,
+          plan: planText,
+          caller_channel_id: reaction.message.channel.id,
+        });
+        const raw = await execPython(
+          [ACTION_EXECUTOR_PATH, '--action', 'dev_task', '--params', params],
+          30000
+        );
+        const parsed = JSON.parse(raw);
+        if (parsed.ok) {
+          const link = `<#${parsed.dev_izuna_channel_id || DEV_IZUNA_CHANNEL_ID}>`;
+          await reaction.message
+            .reply(`🚀 → ${link} に渡しました (envelope: \`${parsed.envelope_id}\`)`)
+            .catch(() => {});
+
+          // === Phase 2d: #dev-izuna に Claude Code session を seed ===
+          // envelope の plan を最初の user prompt として agentRunner.run に渡し、
+          // dev client (Claude Code 同等の tool 解禁) でレスポンスを生成。
+          // 結果を #dev-izuna に投稿することで session が確立 → ユーザーは続きから自然言語で対話可。
+          (async () => {
+            try {
+              const devChannel: any = await client.channels
+                .fetch(DEV_IZUNA_CHANNEL_ID)
+                .catch(() => null);
+              if (!devChannel || typeof devChannel.send !== 'function') return;
+
+              const seedPrompt =
+                `[handoff from <#${reaction.message.channel.id}>]\n` +
+                `以下の plan を一般 Izuna ↔ ユーザー間で合意済み。実装を進めてください。\n` +
+                `不明点や設計判断が必要なら手を止めて質問してください (自走禁止)。\n\n` +
+                `**Original task**: ${taskText}\n\n` +
+                `**Plan**:\n${planText}`;
+
+              const thinkingMsg = await devChannel
+                .send('🤔 一般から受け取った plan を分析中…')
+                .catch(() => null);
+
+              const sid = getActiveSessionId(DEV_IZUNA_CHANNEL_ID);
+              const appSid = ensureSession(DEV_IZUNA_CHANNEL_ID, { platform: 'discord' });
+              const { result, sessionId: newSid } = await agentRunner.run(seedPrompt, {
+                skipPermissions: config.agent.config.skipPermissions ?? false,
+                sessionId: sid,
+                channelId: DEV_IZUNA_CHANNEL_ID,
+                appSessionId: appSid,
+              });
+              setSession(DEV_IZUNA_CHANNEL_ID, newSid);
+
+              const display = (result || '(空応答)').slice(0, 1900);
+              if (thinkingMsg && typeof thinkingMsg.edit === 'function') {
+                await thinkingMsg.edit(display).catch(() => {});
+              } else {
+                await devChannel.send(display).catch(() => {});
+              }
+            } catch (seedErr) {
+              console.error('[xangi] dev-izuna seed error:', seedErr);
+              const devChannel: any = await client.channels
+                .fetch(DEV_IZUNA_CHANNEL_ID)
+                .catch(() => null);
+              if (devChannel && typeof devChannel.send === 'function') {
+                await devChannel
+                  .send('⚠️ Claude Code 起動失敗: ' + String(seedErr).slice(0, 200))
+                  .catch(() => {});
+              }
+            }
+          })();
+        } else {
+          await reaction.message
+            .reply('⚠️ dev_task 失敗: ' + String(parsed.error || '').slice(0, 300))
+            .catch(() => {});
+        }
+      } catch (err) {
+        console.error('[xangi] dev_task reaction error:', err);
+        await reaction.message
+          .reply('⚠️ dev_task 起動失敗: ' + String(err).slice(0, 200))
+          .catch(() => {});
+      }
+      return;
+    }
 
     // === #dev-izuna route リアクション ===
     if (reaction.message.channel.id === DEV_IZUNA_CHANNEL_ID) {
@@ -3869,14 +4125,44 @@ async function main() {
       return;
     }
 
-    // dev-izuna: 自動開発フロー (mention/autoReply 条件を無視して必ず処理)
+    // dev-izuna: Claude Code 自然言語入口 (Phase 2c-fix)
+    // 旧 claude_dev workflow (Notion 探索 + repo 選択 + 自走) は廃止。
+    // 通常 LLM responder に流して dev client (built-in tools 解禁、Read/Edit/Bash 等) で応答させる。
+    // → Claude Code 純正の見せ方 (tool use streaming + file edit + bash output) が #dev-izuna で動く。
+    //
+    // 例外: 旧 workflow の特殊 op (!cancel / !status / キャンセル / ステータス) と
+    // 既に awaiting_route で active な session があれば従来 handler を呼ぶ (legacy 互換)。
     if (isDevIzunaChannel) {
-      try {
-        await handleDevIzunaMessage(message);
-      } catch (e) {
-        console.error('[dev-izuna] handler error:', e);
+      const raw = message.content
+        .replace(/<@[!&]?\d+>/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const isLegacyOp =
+        raw === '!cancel' ||
+        raw === '/cancel' ||
+        raw === 'キャンセル' ||
+        raw === '!status' ||
+        raw === '/status' ||
+        raw === 'ステータス';
+      let hasActiveSession = false;
+      if (!isLegacyOp) {
+        try {
+          const status = await runClaudeDevSync(['status']);
+          hasActiveSession = !!status.active;
+        } catch {
+          hasActiveSession = false;
+        }
       }
-      return;
+      if (isLegacyOp || hasActiveSession) {
+        try {
+          await handleDevIzunaMessage(message);
+        } catch (e) {
+          console.error('[dev-izuna] legacy handler error:', e);
+        }
+        return;
+      }
+      // それ以外は通常 LLM responder に fall through
+      // (= dev client が起動して Claude Code 風の応答が走る)
     }
 
     let prompt = message.content
@@ -5218,17 +5504,47 @@ async function processPrompt(
           `params は SOUL_actions.md の該当行を参照、必須項目だけで OK (任意項目は省略可)。\n` +
           `予定にミーティング/Meet が含まれるなら calendar_create で \`with_meet:true\` を付ける。`;
         const fixResult = await agentRunner.run(fixPrompt, { channelId });
-        if (fixResult?.result) {
-          const fixed = String(fixResult.result);
-          const newActionLines = fixed.match(/\[ACTION:\w+(?:\s+\{[\s\S]*?\})?\s*\]?/g) ?? [];
-          if (newActionLines.length > 0) {
-            result = result + '\n\n' + newActionLines.join('\n');
-            console.log(
-              `[action-mismatch] retry produced ${newActionLines.length} ACTION line(s) (needed ${mismatches.length}), appended`
-            );
-          } else {
-            console.warn('[action-mismatch] retry returned no ACTION marker either, giving up');
+        const fixedText = fixResult?.result ? String(fixResult.result) : '';
+        const newActionLines = fixedText.match(/\[ACTION:\w+(?:\s+\{[\s\S]*?\})?\s*\]?/g) ?? [];
+        const telemetryBase = {
+          channelId,
+          labels: mismatches.map((mm) => mm.label),
+          expected: allExpected,
+          emitted: mismatches[0].emittedActions,
+          matchedTexts: mismatches.map((mm) => mm.matchedText),
+        };
+        if (newActionLines.length > 0) {
+          result = result + '\n\n' + newActionLines.join('\n');
+          console.log(
+            `[action-mismatch] retry produced ${newActionLines.length} ACTION line(s) (needed ${mismatches.length}), appended`
+          );
+          recordActionMismatch({
+            ...telemetryBase,
+            retryStatus: 'success',
+            retryActionCount: newActionLines.length,
+          });
+        } else {
+          // (b) 2026-05-05: silent fail だと「やっておきました⇨できてない」を主が信じてしまうので Discord 通知
+          console.warn(
+            '[action-mismatch] retry returned no ACTION marker either, notifying channel'
+          );
+          try {
+            if ('send' in message.channel) {
+              const labelsTxt = mismatches.map((mm) => `「${mm.matchedText}」`).join(' / ');
+              const noticeMsg =
+                `⚠️ Izuna が ${labelsTxt} と宣言しましたが、対応する ACTION を出せませんでした。\n` +
+                `期待 action: ${allExpected.join(' / ')}\n` +
+                `→ もう一度依頼するか、必要なら手動でお願いします。`;
+              await (message.channel as any).send({ content: noticeMsg });
+            }
+          } catch (notifyErr) {
+            console.error('[action-mismatch] Discord notification failed:', notifyErr);
           }
+          recordActionMismatch({
+            ...telemetryBase,
+            retryStatus: 'failure',
+            retryActionCount: 0,
+          });
         }
       }
     } catch (err) {
